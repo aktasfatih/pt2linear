@@ -12,8 +12,127 @@ require 'time'
 require 'typhoeus'
 require 'tzinfo'
 
+require "csv"
+
 $logger = Logger.new($stdout)
 $logger.level = Logger::INFO
+
+class PivotalCSVParser
+  attr_reader :structured_data
+  attr_reader :csv_given
+
+  COMMENT_META_REGEX = /\s*\(([\w\s]+) - (\w{3} \d+, \d\d\d\d)\)$/
+
+  def initialize(file_path)
+      if file_path.nil? || file_path.empty?
+          @csv_given = false
+          return
+      end
+      @csv_given = true
+      @file_path = file_path
+      @data = CSV.table(file_path, headers: true)
+      @headers = @data.headers
+      @structured_data = parse_to_structure
+      @stories_with_attachments = parse_file_path_directory
+  end
+
+  # Is used to make requests only for stories that have attachments
+  def parse_file_path_directory
+    directory_path = File.dirname(@file_path)
+    numeric_directories = Set.new
+
+    Dir.foreach(directory_path) do |entry|
+        next if entry == '.' || entry == '..'
+        full_path = File.join(directory_path, entry)
+        if File.directory?(full_path) && entry.match?(/^\d+$/)
+            numeric_directories.add(entry)
+        end
+    end
+
+    numeric_directories
+  end
+
+  # Returns true if the story has attachments
+  def is_story_with_attachments?(story_id)
+      @stories_with_attachments.include?(story_id)
+  end
+
+  def find_by_pivotal_tracker_id(pt_id)
+      @structured_data[pt_id]
+  end
+
+  def parse_to_structure
+      structured_data = {}
+      @data.each_with_index do |row, i|
+          id = row[:id]
+          structured_data[id] ||= {}
+
+          comments = []
+          tasks = []
+          reviews = []
+          blockers = []
+          pull_requests = []
+          (0..@headers.length).each do |j|
+              # Handling comments
+              if @headers[j].to_s == 'comment' && row[j] != nil
+                  comment_author_date = row[j].match(COMMENT_META_REGEX)
+                  if comment_author_date
+                      comment_text = row[j].sub(COMMENT_META_REGEX, '').strip
+                      comments << { 'story_id' => id, 'text' => comment_text, 'author' => comment_author_date[1], 'date' => comment_author_date[2] }
+                  else
+                      comments << { 'story_id' => id, 'text' => row[j], 'author' => nil, 'date' => nil }
+                      $logger.error "Comment without author and date: #{row[j]}"
+                  end
+                  next
+              end
+
+              # Handling tasks
+              if @headers[j].to_s == "task" && row[j] != nil
+                  tasks << { "task" => row[j], "complete" => row[j + 1] }
+                  next
+              end
+              next if @headers[j].to_s == "task_status" # Handled right above
+
+              # Handling the reviews
+              if @headers[j].to_s == "review_type" && row[j] != nil
+                  reviews << { "type" => row[j], "reviewer" => row[j + 1], "status" => row[j + 2] }
+                  next
+              end
+              next if @headers[j].to_s == "reviewer" || @headers[j].to_s == "review_status" # Handled right above
+
+              # Handling blockers
+              if @headers[j].to_s == "blocker" && row[j] != nil
+                  blockers << { "blocker" => row[j], "status" => row[j + 1] }
+                  next
+              end
+              next if @headers[j].to_s == "blocker_status" # Handled right above
+
+              # Handling pull requests
+              if @headers[j].to_s == "pull_request" && row[j] != nil
+                  pull_requests << { "url" => row[j] }
+                  next
+              end
+
+              # Making labels similar to the API
+              if @headers[j].to_s == "labels" && row[j] != nil
+                structured_data[id]['labels'] = row[j].split(',').map do |label|
+                { 'name' => label.strip }
+                end
+                next
+              end
+
+              structured_data[id][@headers[j].to_s] = row[j] if @headers[j] != nil
+          end
+          structured_data[id]['comments'] = comments
+          structured_data[id]['tasks'] = tasks
+          structured_data[id]['reviews'] = reviews
+          structured_data[id]['blockers'] = blockers
+          structured_data[id]['pull_requests'] = pull_requests
+      end
+      structured_data
+  end
+end
+
 
 class PivotalTrackerClient
   BASE_URL = 'https://www.pivotaltracker.com/services/v5'
@@ -427,6 +546,9 @@ class LinearClient
             nodes {
               id
               title
+              team {
+                name
+              }
             }
           }
         }
@@ -435,10 +557,15 @@ class LinearClient
     response = post(query)
     data = JSON.parse(response.body)
     issues = data.dig('data', 'issues', 'nodes')
-    issues.first if issues.any?
+
+    if issues.any?
+      if issues.first.dig('team', 'name') == ENV['LINEAR_TEAM_NAME']
+        issues.first
+      end
+    end
   end
 
-  def create_issue(title, description, label_names)
+  def create_issue(title, description, label_names, estimate, assigneeUser)
     label_ids = label_names.map { |name| fetch_or_create_label(name) }.compact
 
     input = {
@@ -448,16 +575,25 @@ class LinearClient
       labelIds: label_ids
     }
 
+    unless assigneeUser.nil?
+      input["assigneeId"] = assigneeUser["id"]
+    end
+
+    if estimate != "Unestimated"
+      input["estimate"] = estimate
+    end
+
     mutation = <<-GRAPHQL
-        mutation CreateIssue($input: IssueCreateInput!) {
-          issueCreate(input: $input) {
-            success
-            issue {
-              id
-              title
-            }
-          }
+      mutation CreateIssue($input: IssueCreateInput!) {
+        issueCreate(input: $input) {
+        success
+        issue {
+          id
+          title
+          estimate
         }
+        }
+      }
     GRAPHQL
 
     variables = { input: }
@@ -1022,10 +1158,10 @@ class MigrationManager
   }.freeze
 
   PT_TO_LINEAR_STATE = {
-    'unscheduled' => 'Icebox',
+    'unscheduled' => 'Triage',
     'unstarted' => 'Backlog',
     'started' => 'In Progress',
-    'finished' => 'In Review',
+    'finished' => 'Todo', # Todo represents the code is done, but there is work left to do such as reviews
     'delivered' => 'Ready to Merge', # This is correct and should not be changed
     'accepted' => 'Done',
     'rejected' => 'Todo'
@@ -1034,6 +1170,7 @@ class MigrationManager
   def initialize(dry_run: false)
     @pt_client = PivotalTrackerClient.new
     @linear_client = LinearClient.new
+    @pt_csv_reader = PivotalCSVParser.new(ENV['PT_CSV_FILE'])
     @dry_run = dry_run
     @epic_mapping = {}
     @label_to_epic_mapping = {}
@@ -1163,7 +1300,17 @@ class MigrationManager
   end
 
   def migrate_stories
-    stories = @pt_client.fetch_all_stories
+    if @pt_csv_reader.csv_given
+      stories = @pt_csv_reader.structured_data.values.flatten
+      $logger.info "Using CSV with #{stories.length} stories" if @pt_csv_reader.csv_given
+    else
+      stories = @pt_client.fetch_all_stories
+      puts "Fetched #{stories.size} stories from Pivotal Tracker"
+    end
+
+    # For debugging specific stories
+    # stories = stories.select { |story| story['id'] == 186164568 }
+    # stories = stories.select { |story| story['id'] == 188115984 }
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
@@ -1174,6 +1321,7 @@ class MigrationManager
     previous_issue_id = nil # Track the last migrated issue
 
     sorted_stories.each do |story|
+      puts "Story Details: #{story}"
       bar.increment!
       pt_link = "https://www.pivotaltracker.com/story/show/#{story['id']}"
 
@@ -1184,54 +1332,129 @@ class MigrationManager
         next
       end
 
-      story_details = @pt_client.fetch_story_details(story['id'])
-
-      last_assigned = if story_details['owner_ids'] && !story_details['owner_ids'].empty?
-                        owner_id = story_details['owner_ids'].last
-                        owner = @pt_team_members[owner_id]
-                        owner ? "#{owner['name']} <#{owner['email']}>" : 'Unassigned'
-                      else
-                        'Unassigned'
-                      end
-
-      description = "#{story_details['description']}\n\n---\nPivotal Story: #{pt_link}\nLast assigned to: #{last_assigned}"
-
-      unless story_details['pull_requests'].empty?
-        description += "\n\nPull Requests:\n" + story_details['pull_requests'].map do |pr|
-          pr_url = "#{pr['host_url']}#{pr['owner']}/#{pr['repo']}/pull/#{pr['number']}"
-          "- [##{pr['number']}](#{pr_url}) (#{pr['status']})"
-        end.join("\n")
+      if @pt_csv_reader.csv_given
+        story_details = @pt_csv_reader.find_by_pivotal_tracker_id(story['id'])
+        last_assigned = story_details['owned_by'] || 'Unassigned'
+        requested_by = story_details['requested_by']
+      else
+        story_details = @pt_client.fetch_story_details(story['id'])
+        last_assigned = if story_details['owner_ids'] && !story_details['owner_ids'].empty?
+                          owner_id = story_details['owner_ids'].last
+                          owner = @pt_team_members[owner_id]
+                          owner ? "#{owner['name']} <#{owner['email']}>" : 'Unassigned'
+                        else
+                          'Unassigned'
+                        end
+        requested_by = get_pt_comment_author(story_details['requested_by_id'])
       end
 
-      unless story_details['branches'].empty?
-        description += "\n\nBranches:\n" + story_details['branches'].map do |branch|
-          branch_url = "#{branch['host_url']}#{branch['owner']}/#{branch['repo']}/tree/#{branch['name']}"
-          "- [`#{branch['name']}`](#{branch_url})"
-        end.join("\n")
+      description = "#{story_details['description']}\n\n---\nPivotal Story: #{pt_link}\nOwner: #{last_assigned}\nRequested by: #{requested_by}"
+
+      if @pt_csv_reader.csv_given
+        description += "\nPull Requests: " 
+        if story_details['pull_requests'].any?
+          description += story_details['pull_requests'].map do |pr|
+            pr_url = pr["url"]
+          end.join(" ") + "\n"
+        else
+          description += "none\n"
+        end
+      else
+        unless story_details['pull_requests'].empty?
+          description += "Pull Requests:\n" + story_details['pull_requests'].map do |pr|
+            pr_url = "#{pr['host_url']}#{pr['owner']}/#{pr['repo']}/pull/#{pr['number']}"
+            "- [##{pr['number']}](#{pr_url}) (#{pr['status']})"
+          end.join("\n") + "\n"
+        end
       end
+
+      if @pt_csv_reader.csv_given
+        description += "Blockers: "
+        if story_details['blockers'].any?
+          description += "\n"
+          description += story_details['blockers'].map do |blocker|
+            " | #{blocker['blocker']} (#{blocker['status']})"
+          end.join("\n") + "\n"
+        else
+          description += "none\n"
+        end
+      end
+
+      if @pt_csv_reader.csv_given
+        description += "Tasks: "
+        if story_details['tasks'].any?
+          description += "\n"
+          description += story_details['tasks'].map do |task|
+            " | #{task['task']} (#{task['complete']})"
+          end.join("\n") + "\n"
+        else
+          description += "none\n"
+        end
+      end
+
+      if @pt_csv_reader.csv_given
+        description += "Reviews: "
+        if story_details['reviews'].any?
+          description += "\n"
+          description += story_details['reviews'].map do |review|
+            " | #{review['type']}: #{review['reviewer']} (#{review['status']})"
+          end.join("\n")
+        else  
+          description += " none\n"
+        end
+      end
+
+      # unless @pt_csv_reader.csv_given
+      #   unless story_details['branches'].empty?
+      #     description += "\n\nBranches:\n" + story_details['branches'].map do |branch|
+      #       branch_url = "#{branch['host_url']}#{branch['owner']}/#{branch['repo']}/tree/#{branch['name']}"
+      #       "| [`#{branch['name']}`](#{branch_url})"
+      #     end.join("\n")
+      #   end
+      # end
+
+      # I have no words for this one. Took me a while to figure out what was going on.
+      if @pt_csv_reader.csv_given
+        title = story['title'] # Unlike the API, csv uses 'title' instead of 'name'
+      else
+        title = story['name']
+      end
+
+      estimate = story['estimate'] ? story['estimate'].to_i : 'Unestimated'
 
       label_names = story_details['labels'].map { |label| label['name'] }
       label_names << 'migrated_story'
       label_names.uniq!
 
+      commentsBody = comments_for_description(story['id'])
+      unless commentsBody.empty?
+        description += "\n\n---\n# PT Comments:\n"
+        description += commentsBody
+      end
+
+      user = find_matching_user(last_assigned)
+      # user = find_matching_user("#{last_assigned['name']} <#{pt_owner['email']}>")
+
       if @dry_run
         $logger.info "[DRY RUN] Would create story: '#{story['name']}' with labels: #{label_names.join(', ')}"
       else
         linear_issue = create_linear_issue(
-          story['name'],
+          title,
           description,
           label_names,
           story['current_state'],
-          previous_issue_id
+          previous_issue_id,
+          estimate,
+          assigneeId: user,
         )
 
         if linear_issue
           previous_issue_id = linear_issue['id']
           link_to_epic(linear_issue['id'], story_details['labels'])
-          migrate_story_comments_and_attachments(story['id'], linear_issue['id'])
-          migrate_story_tasks(story['id'], linear_issue['id'])
+          # migrate_story_comments_and_attachments(story['id'], linear_issue['id'])
+          # migrate_story_tasks(story['id'], linear_issue['id'])
 
-          assign_issue(linear_issue['id'], last_assigned) unless last_assigned == 'Unassigned'
+          # assign_issue(linear_issue['id'], last_assigned) unless last_assigned == 'Unassigned'
         else
           $logger.error "Failed to create story in Linear: #{story['name']}"
         end
@@ -1239,8 +1462,95 @@ class MigrationManager
     end
   end
 
+  def comments_for_description(story_id)
+    if @pt_csv_reader.csv_given
+      puts "Checking if story #{story_id} has attachments"
+      if @pt_csv_reader.is_story_with_attachments?(story_id.to_s)
+        puts "Story #{story_id} has attachments"
+        comments = @pt_client.fetch_story_comments(story_id)
+      else
+        puts "Story #{story_id} does not have attachments"
+        comments = @pt_csv_reader.find_by_pivotal_tracker_id(story_id)['comments']
+      end
+    else
+      comments = @pt_client.fetch_story_comments(story_id)
+    end
+    $logger.info "Adding #{comments.size} comments to the description of the story #{story_id}"
+
+    puts "Comments: #{comments.inspect}"
+
+    if comments.empty?
+      return ''
+    end
+
+    commentBodies = comments.map do |comment|
+      create_text_for_comment(comment)
+    end
+
+    "\n"+commentBodies.join("\n---\n")
+  end
+
+  def create_text_for_comment(comment)
+    if @pt_csv_reader.csv_given && !@pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
+      puts "Taking author,date from csv"
+      author_name = comment['author']
+      date = comment['date']
+      puts "Author: #{author_name}, Date: #{date}"
+      puts "Comment: #{comment['text']}"
+    else
+      puts "Taking author,date from api" 
+      person_id = comment['person_id']
+      person_info = @pt_team_members[person_id]
+      unless person_info
+        $logger.warn "Could not find person information for comment by person_id: #{person_id}"
+        return
+      end
+      author_name = person_info['name']
+      created_at = comment['created_at']
+      date = Time.parse(created_at).strftime("%b %d, %Y")
+    end
+
+    body = "Comment by #{author_name} [#{date}]:\n\n#{comment['text']}"
+
+    puts "Processing attachments"
+    if @pt_csv_reader.csv_given
+      if @pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
+        puts "Story #{comment['story_id']} has attachments"
+        attachments = process_attachments(comment)
+      else
+        puts "Story #{comment['story_id']} does not have attachments"
+        attachments = []
+      end
+    else
+      attachments = process_attachments(comment)
+    end
+
+    attachment_markdown = attachments.map do |attachment|
+      puts "[DEBUG] Processing attachment: #{attachment[:filename]} (type: #{attachment[:type]})"
+
+      if attachment[:type].start_with?('image/')
+        "![#{attachment[:filename]}](#{attachment[:url]})"
+      else
+        "[#{attachment[:filename]}](#{attachment[:url]})"
+      end
+    end.join("\n\n")
+
+    full_body = "#{body}\n\n#{attachment_markdown}"
+  end
+
   def migrate_story_comments_and_attachments(story_id, linear_issue_id)
-    comments = @pt_client.fetch_story_comments(story_id)
+    if @pt_csv_reader.csv_given
+      puts "Checking if story #{story_id} has attachments"
+      if @pt_csv_reader.is_story_with_attachments?(story_id.to_s)
+        puts "Story #{story_id} has attachments"
+        comments = @pt_client.fetch_story_comments(story_id)
+      else
+        puts "Story #{story_id} does not have attachments"
+        comments = @pt_csv_reader.find_by_pivotal_tracker_id(story_id)['comments']
+      end
+    else
+      comments = @pt_client.fetch_story_comments(story_id)
+    end
     $logger.info "Migrating #{comments.size} comments for story #{story_id}"
 
     comments.each do |comment|
@@ -1249,32 +1559,54 @@ class MigrationManager
   end
 
   def process_story_comment(comment, linear_issue_id)
-    person_id = comment['person_id']
-    person_info = @pt_team_members[person_id]
-
-    if person_info
+    puts comment.inspect
+    if @pt_csv_reader.csv_given
+      puts "Taking author,date from csv"
+      author_name = comment['author']
+      date = comment['date']
+      puts "Author: #{author_name}, Date: #{date}"
+      puts "Comment: #{comment['text']}"
+    else
+      puts "Taking author,date from api" 
+      person_id = comment['person_id']
+      person_info = @pt_team_members[person_id]
+      unless person_info
+        $logger.warn "Could not find person information for comment by person_id: #{person_id}"
+        return
+      end
       author_name = person_info['name']
-      author_email = person_info['email']
+      created_at = comment['created_at']
+      date = Time.parse(created_at).strftime("%b %d, %Y")
+    end
 
-      body = "Comment by #{author_name} <#{author_email}>:\n\n#{comment['text']}"
 
-      attachments = process_attachments(comment)
+    body = "Comment by #{author_name} [#{date}]:\n\n#{comment['text']}"
 
-      if @dry_run
-        $logger.info "[DRY RUN] Would create comment: '#{body[0..50]}...'"
-        if attachments.any?
-          $logger.info "[DRY RUN] Would create attachments: #{attachments.map { |a| a[:filename] }.join(', ')}"
-        end
+    puts "Processing attachments"
+    if @pt_csv_reader.csv_given
+      if @pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
+        puts "Story #{comment['story_id']} has attachments"
+        attachments = process_attachments(comment)
       else
-        linear_comment = @linear_client.create_comment_with_attachments(linear_issue_id, body, attachments)
-        if linear_comment
-          $logger.info "Created comment with #{attachments.size} attachments for issue #{linear_issue_id}"
-        else
-          $logger.error "Failed to create comment for issue #{linear_issue_id}"
-        end
+        puts "Story #{comment['story_id']} does not have attachments"
+        attachments = []
       end
     else
-      $logger.warn "Could not find person information for comment by person_id: #{person_id}"
+      attachments = process_attachments(comment)
+    end
+
+    if @dry_run
+      $logger.info "[DRY RUN] Would create comment: '#{body[0..50]}...'"
+      if attachments.any?
+        $logger.info "[DRY RUN] Would create attachments: #{attachments.map { |a| a[:filename] }.join(', ')}"
+      end
+    else
+      linear_comment = @linear_client.create_comment_with_attachments(linear_issue_id, body, attachments)
+      if linear_comment
+        $logger.info "Created comment with #{attachments.size} attachments for issue #{linear_issue_id}"
+      else
+        $logger.error "Failed to create comment for issue #{linear_issue_id}"
+      end
     end
   rescue StandardError => e
     $logger.error "Failed to process comment: #{e.message}"
@@ -1287,7 +1619,7 @@ class MigrationManager
     return [] unless comment['file_attachments']
 
     comment['file_attachments'].map do |attachment|
-      process_attachment(attachment)
+      process_attachment(attachment, comment['story_id'])
     end.compact
   end
 
@@ -1434,12 +1766,26 @@ class MigrationManager
     end
   end
 
-  def process_attachment(attachment)
+  def process_attachment(attachment,story_id=nil)
     $logger.debug "Processing attachment: #{attachment['filename']}"
-    temp_file_path = @pt_client.download_attachment(attachment['download_url'], attachment['filename'])
+    if story_id.nil?
+      temp_file_path = @pt_client.download_attachment(attachment['download_url'], attachment['filename'])
+      $logger.debug "Downloaded attachment to: #{temp_file_path}"
+    else
+      puts "Using the downloaded attachment from the csv"
+      # Saving requests on the attachments, which should be within the same folder
+      # as the csv.
+      file_path = ENV['PT_CSV_FILE']
+      directory_path = File.dirname(file_path)
+      temp_file_path = File.join(directory_path, story_id.to_s, attachment['filename'])
+      puts "Story ID: #{story_id}"
+      puts "Temp file path: #{temp_file_path}"
+    end
     if temp_file_path
       result = @linear_client.upload_file(temp_file_path, attachment['filename'])
-      File.delete(temp_file_path)
+      unless @pt_csv_reader.csv_given
+        File.delete(temp_file_path)
+      end
       if result
         $logger.debug "Successfully uploaded attachment to Linear: #{attachment['filename']}"
         $logger.debug "Attachment type: #{result[:type]}"
@@ -1465,9 +1811,14 @@ class MigrationManager
   end
 
   def migrate_story_tasks(story_id, linear_id)
-    tasks = @pt_client.fetch_story_tasks(story_id)
+    if @pt_csv_reader.csv_given
+      tasks = @pt_csv_reader.find_by_pivotal_tracker_id(story_id)['tasks']
+    else
+      tasks = @pt_client.fetch_story_tasks(story_id)
+    end
+
     tasks.each do |task|
-      body = "Task: #{task['description']}\nStatus: #{task['complete'] ? 'Completed' : 'Not Completed'}"
+      body = "Task: #{task['task']}\nStatus: #{task['complete'] ? 'completed' : 'not nompleted'}"
       if @dry_run
         $logger.info "[DRY RUN] Would create task comment: '#{body[0..50]}...'"
       else
@@ -1518,7 +1869,7 @@ class MigrationManager
     end
   end
 
-  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id)
+  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id, estimate, assigneeUser)
     linear_state = PT_TO_LINEAR_STATE[pt_state]
     state_id = @linear_client.get_state_id(linear_state)
 
@@ -1526,7 +1877,7 @@ class MigrationManager
       $logger.info "[DRY RUN] Would create issue: '#{title}' with state: #{linear_state}"
       nil
     else
-      issue = @linear_client.create_issue(title, description, label_names)
+      issue = @linear_client.create_issue(title, description, label_names, estimate, assigneeUser)
 
       if issue
         @linear_client.update_issue(issue['id'], { stateId: state_id }) if state_id
