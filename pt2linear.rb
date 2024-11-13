@@ -121,6 +121,14 @@ class PivotalCSVParser
                 next
               end
 
+              # Remove the first three spaces if they exist
+              if @headers[j].to_s == "description" && row[j] != nil
+                if row[j].start_with?("\t")
+                  structured_data[id]['description'] = row[j][1..-1]
+                end
+                next
+              end
+
               structured_data[id][@headers[j].to_s] = row[j] if @headers[j] != nil
           end
           structured_data[id]['comments'] = comments
@@ -1311,6 +1319,7 @@ class MigrationManager
     # For debugging specific stories
     # stories = stories.select { |story| story['id'] == 186164568 }
     # stories = stories.select { |story| story['id'] == 188115984 }
+    stories = stories.select { |story| story['id'] == 188369021 }
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
