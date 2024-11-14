@@ -125,6 +125,8 @@ class PivotalCSVParser
               if @headers[j].to_s == "description" && row[j] != nil
                 if row[j].start_with?("\t")
                   structured_data[id]['description'] = row[j][1..-1]
+                else
+                  structured_data[id]['description'] = row[j]
                 end
                 next
               end
@@ -1319,7 +1321,7 @@ class MigrationManager
     # For debugging specific stories
     # stories = stories.select { |story| story['id'] == 186164568 }
     # stories = stories.select { |story| story['id'] == 188115984 }
-    stories = stories.select { |story| story['id'] == 188369021 }
+    # stories = stories.select { |story| story['id'] == 188369021 }
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
