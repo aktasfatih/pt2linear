@@ -575,7 +575,7 @@ class LinearClient
     end
   end
 
-  def create_issue(title, description, label_names, estimate, assigneeUserID)
+  def create_issue(title, description, label_names, estimate, assigneeUser)
     label_ids = label_names.map { |name| fetch_or_create_label(name) }.compact
 
     input = {
@@ -585,8 +585,8 @@ class LinearClient
       labelIds: label_ids
     }
 
-    unless assigneeUserID.nil?
-      input["assigneeId"] = assigneeUserID.to_s
+    unless assigneeUser.nil?
+      input["assigneeId"] = assigneeUser['id'].to_s
     end
 
     if estimate != "Unestimated"
@@ -1171,7 +1171,7 @@ class MigrationManager
     'unscheduled' => 'Triage',
     'unstarted' => 'Backlog',
     'started' => 'In Progress',
-    'finished' => 'Todo', # Todo represents the code is done, but there is work left to do such as reviews
+    'finished' => 'Finished',
     'delivered' => 'Ready to Merge', # This is correct and should not be changed
     'accepted' => 'Done',
     'rejected' => 'Todo'
@@ -1444,9 +1444,6 @@ class MigrationManager
       end
 
       user = find_matching_user(last_assigned)
-      # user = find_matching_user("#{last_assigned['name']} <#{pt_owner['email']}>")
-      puts "USER: #{user.inspect}"
-      puts "USER ID: #{user['id']}"
 
       if @dry_run
         $logger.info "[DRY RUN] Would create story: '#{story['name']}' with labels: #{label_names.join(', ')}"
@@ -1458,7 +1455,7 @@ class MigrationManager
           story['current_state'],
           previous_issue_id,
           estimate,
-          user['id'],
+          user,
         )
 
         if linear_issue
@@ -1882,7 +1879,7 @@ class MigrationManager
     end
   end
 
-  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id, estimate, assigneeUserID)
+  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id, estimate, assigneeUser)
     linear_state = PT_TO_LINEAR_STATE[pt_state]
     state_id = @linear_client.get_state_id(linear_state)
 
@@ -1890,7 +1887,7 @@ class MigrationManager
       $logger.info "[DRY RUN] Would create issue: '#{title}' with state: #{linear_state}"
       nil
     else
-      issue = @linear_client.create_issue(title, description, label_names, estimate, assigneeUserID)
+      issue = @linear_client.create_issue(title, description, label_names, estimate, assigneeUser)
 
       if issue
         @linear_client.update_issue(issue['id'], { stateId: state_id }) if state_id
