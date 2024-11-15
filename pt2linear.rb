@@ -11,6 +11,7 @@ require 'tempfile'
 require 'time'
 require 'typhoeus'
 require 'tzinfo'
+require 'enumerator'
 
 require "csv"
 
@@ -351,7 +352,83 @@ class LinearClient
     @team_id = find_team_id(ENV['LINEAR_TEAM_NAME'])
 
     @already_migrated_epics = find_all_pt_epics_from_linear
+
+    @issue_create_queue = []
+    @issue_create_batch = 100
   end
+
+  # For creating issues in batches
+  def queue_issue_create(story_info)
+    @issue_create_queue << story_info
+  end
+  def queue_issue_create_process()
+    query = <<-GRAPHQL
+      mutation(%s){
+        %s
+      }
+    GRAPHQL
+
+    @issue_create_queue.each_slice(@issue_create_batch) do |batch|
+      mutations = batch.each_with_index.map do |story_info, index|
+      <<-GRAPHQL
+        s#{index}: issueCreate(input: $input#{index}) {
+        success
+        issue {
+          id
+          title
+        }
+        }
+      GRAPHQL
+      end.join("\n")
+
+      inputs = batch.each_with_index.map do |story_info, index|
+      <<-GRAPHQL
+        $input#{index}: IssueCreateInput!
+      GRAPHQL
+      end.join(",\n")
+
+      query_with_mutations = query % [inputs, mutations]
+
+      variables = batch.each_with_index.map do |story_info, index|
+        inputHash = {
+          title: story_info[:title],
+          description: story_info[:description],
+          teamId: @team_id,
+          stateId: story_info[:state_id]
+        }
+
+        unless story_info[:label_ids].empty?
+          inputHash["labelIds"] = story_info[:label_ids]
+        end
+
+        unless story_info[:user].nil?
+          inputHash["assigneeId"] = story_info[:user]['id'].to_s
+        end
+
+        if story_info[:estimate]!= "Unestimated"
+          inputHash["estimate"] = story_info[:estimate]
+        end
+
+        ["input#{index}".to_sym, inputHash]
+      end.to_h
+
+      puts "VARIABLES"
+      puts variables
+      response = post(query_with_mutations, variables)
+      log_response(response, 'Create Issue Batch')
+      body = JSON.parse(response.body)
+
+      body["data"].each do |key, value|
+        print "Key: #{key} Value: #{value}"
+        if value['success'] == true
+          puts "Successfully created issue: #{value['issue']['title']} (ID: #{value['issue']['id']})"
+        else
+          puts "Failed to create issue for batch item: #{key}"
+        end
+      end
+    end
+  end
+
 
   def find_team_id(team_name)
     query = <<-GRAPHQL
@@ -867,7 +944,7 @@ class LinearClient
 
     variables = { teamId: @team_id }
     response = post(query, variables)
-    log_response(response, 'Fetch Team Members')
+    # log_response(response, 'Fetch Team Members')
 
     data = JSON.parse(response.body)
     members = data.dig('data', 'team', 'members', 'nodes')
@@ -962,7 +1039,7 @@ class LinearClient
     data.dig('data', 'issueLabelCreate', 'issueLabel', 'id')
   end
 
-  private
+  # private
 
   def post(query, variables = nil)
     body = { query: }
@@ -1332,16 +1409,16 @@ class MigrationManager
     previous_issue_id = nil # Track the last migrated issue
 
     sorted_stories.each do |story|
-      puts "Story Details: #{story}"
+      # puts "Story Details: #{story}"
       bar.increment!
       pt_link = "https://www.pivotaltracker.com/story/show/#{story['id']}"
 
-      existing_issue = @linear_client.find_issue_by_pt_link(pt_link)
-      if existing_issue
-        $logger.info "Story already migrated: #{existing_issue['title']}"
-        previous_issue_id = existing_issue['id']
-        next
-      end
+      # existing_issue = @linear_client.find_issue_by_pt_link(pt_link)
+      # if existing_issue
+      #   $logger.info "Story already migrated: #{existing_issue['title']}"
+      #   previous_issue_id = existing_issue['id']
+      #   next
+      # end
 
       if @pt_csv_reader.csv_given
         story_details = @pt_csv_reader.find_by_pivotal_tracker_id(story['id'])
@@ -1448,46 +1525,61 @@ class MigrationManager
       if @dry_run
         $logger.info "[DRY RUN] Would create story: '#{story['name']}' with labels: #{label_names.join(', ')}"
       else
-        linear_issue = create_linear_issue(
-          title,
-          description,
-          label_names,
-          story['current_state'],
-          previous_issue_id,
-          estimate,
-          user,
-        )
+        # linear_issue = create_linear_issue(
+        #   title,
+        #   description,
+        #   label_names,
+        #   story['current_state'],
+        #   previous_issue_id,
+        #   estimate,
+        #   user,
+        #   story_details['labels']
+        # )
+        linear_state = PT_TO_LINEAR_STATE[story['current_state']]
+        state_id = @linear_client.get_state_id(linear_state)
 
-        if linear_issue
-          previous_issue_id = linear_issue['id']
-          link_to_epic(linear_issue['id'], story_details['labels'])
-          # migrate_story_comments_and_attachments(story['id'], linear_issue['id'])
-          # migrate_story_tasks(story['id'], linear_issue['id'])
+        label_ids = label_names.map { |name| @linear_client.fetch_or_create_label(name) }.compact
 
-          # assign_issue(linear_issue['id'], last_assigned) unless last_assigned == 'Unassigned'
-        else
-          $logger.error "Failed to create story in Linear: #{story['name']}"
-        end
+        story_info = {
+          title:,
+          description:,
+          label_ids:,
+          estimate:,
+          user:,
+          state_id:
+        }
+        @linear_client.queue_issue_create( story_info)
+        
+        # if linear_issue
+        #   # previous_issue_id = linear_issue['id']
+        #   # link_to_epic(linear_issue['id'], story_details['labels'])
+        #   # migrate_story_comments_and_attachments(story['id'], linear_issue['id'])
+        #   # migrate_story_tasks(story['id'], linear_issue['id'])
+        #   # assign_issue(linear_issue['id'], last_assigned) unless last_assigned == 'Unassigned'
+        # else
+        #   $logger.error "Failed to create story in Linear: #{story['name']}"
+        # end
       end
     end
+    @linear_client.queue_issue_create_process
   end
 
   def comments_for_description(story_id)
     if @pt_csv_reader.csv_given
-      puts "Checking if story #{story_id} has attachments"
+      # puts "Checking if story #{story_id} has attachments"
       if @pt_csv_reader.is_story_with_attachments?(story_id.to_s)
-        puts "Story #{story_id} has attachments"
+        # puts "Story #{story_id} has attachments"
         comments = @pt_client.fetch_story_comments(story_id)
       else
-        puts "Story #{story_id} does not have attachments"
+        # puts "Story #{story_id} does not have attachments"
         comments = @pt_csv_reader.find_by_pivotal_tracker_id(story_id)['comments']
       end
     else
       comments = @pt_client.fetch_story_comments(story_id)
     end
-    $logger.info "Adding #{comments.size} comments to the description of the story #{story_id}"
+    # $logger.info "Adding #{comments.size} comments to the description of the story #{story_id}"
 
-    puts "Comments: #{comments.inspect}"
+    # puts "Comments: #{comments.inspect}"
 
     if comments.empty?
       return ''
@@ -1502,13 +1594,13 @@ class MigrationManager
 
   def create_text_for_comment(comment)
     if @pt_csv_reader.csv_given && !@pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
-      puts "Taking author,date from csv"
+      # puts "Taking author,date from csv"
       author_name = comment['author']
       date = comment['date']
-      puts "Author: #{author_name}, Date: #{date}"
-      puts "Comment: #{comment['text']}"
+      # puts "Author: #{author_name}, Date: #{date}"
+      # puts "Comment: #{comment['text']}"
     else
-      puts "Taking author,date from api" 
+      # puts "Taking author,date from api" 
       person_id = comment['person_id']
       person_info = @pt_team_members[person_id]
       unless person_info
@@ -1522,13 +1614,13 @@ class MigrationManager
 
     body = "Comment by #{author_name} [#{date}]:\n\n#{comment['text']}"
 
-    puts "Processing attachments"
+    # puts "Processing attachments"
     if @pt_csv_reader.csv_given
       if @pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
-        puts "Story #{comment['story_id']} has attachments"
+        # puts "Story #{comment['story_id']} has attachments"
         attachments = process_attachments(comment)
       else
-        puts "Story #{comment['story_id']} does not have attachments"
+        # puts "Story #{comment['story_id']} does not have attachments"
         attachments = []
       end
     else
@@ -1536,7 +1628,7 @@ class MigrationManager
     end
 
     attachment_markdown = attachments.map do |attachment|
-      puts "[DEBUG] Processing attachment: #{attachment[:filename]} (type: #{attachment[:type]})"
+      # puts "[DEBUG] Processing attachment: #{attachment[:filename]} (type: #{attachment[:type]})"
 
       if attachment[:type].start_with?('image/')
         "![#{attachment[:filename]}](#{attachment[:url]})"
@@ -1550,12 +1642,12 @@ class MigrationManager
 
   def migrate_story_comments_and_attachments(story_id, linear_issue_id)
     if @pt_csv_reader.csv_given
-      puts "Checking if story #{story_id} has attachments"
+      # puts "Checking if story #{story_id} has attachments"
       if @pt_csv_reader.is_story_with_attachments?(story_id.to_s)
-        puts "Story #{story_id} has attachments"
+        # puts "Story #{story_id} has attachments"
         comments = @pt_client.fetch_story_comments(story_id)
       else
-        puts "Story #{story_id} does not have attachments"
+        # puts "Story #{story_id} does not have attachments"
         comments = @pt_csv_reader.find_by_pivotal_tracker_id(story_id)['comments']
       end
     else
@@ -1879,7 +1971,7 @@ class MigrationManager
     end
   end
 
-  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id, estimate, assigneeUser)
+  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id, estimate, assigneeUser, labels)
     linear_state = PT_TO_LINEAR_STATE[pt_state]
     state_id = @linear_client.get_state_id(linear_state)
 
