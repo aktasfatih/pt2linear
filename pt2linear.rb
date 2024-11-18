@@ -361,6 +361,7 @@ class LinearClient
   def queue_issue_create(story_info)
     @issue_create_queue << story_info
   end
+
   def queue_issue_create_process()
     query = <<-GRAPHQL
       mutation(%s){
@@ -652,45 +653,6 @@ class LinearClient
     end
   end
 
-  def create_issue(title, description, label_names, estimate, assigneeUser)
-    label_ids = label_names.map { |name| fetch_or_create_label(name) }.compact
-
-    input = {
-      title:,
-      description:,
-      teamId: @team_id,
-      labelIds: label_ids
-    }
-
-    unless assigneeUser.nil?
-      input["assigneeId"] = assigneeUser['id'].to_s
-    end
-
-    if estimate != "Unestimated"
-      input["estimate"] = estimate
-    end
-
-    mutation = <<-GRAPHQL
-      mutation CreateIssue($input: IssueCreateInput!) {
-        issueCreate(input: $input) {
-        success
-        issue {
-          id
-          title
-          estimate
-        }
-        }
-      }
-    GRAPHQL
-
-    variables = { input: }
-
-    response = post(mutation, variables)
-    log_response(response, 'Create Issue')
-    data = JSON.parse(response.body)
-    data.dig('data', 'issueCreate', 'issue')
-  end
-
   def update_issue(issue_id, input)
     mutation = <<-GRAPHQL
         mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
@@ -902,29 +864,53 @@ class LinearClient
 
   def fetch_labels
     query = <<-GRAPHQL
-        query {
-          issueLabels(first: 250)  {
-            nodes {
-              id
-              name
+      query($teamId: String!, $after: String, $first: Int){
+        team(id: $teamId) {
+          labels (after: $after, first: $first){
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              node {
+                id
+                name
+              }
             }
           }
         }
+      }
     GRAPHQL
 
-    response = post(query)
-    log_response(response, 'Fetch Labels')
+    after = nil
+    first = 250
+    hasNextPage = true
 
-    data = JSON.parse(response.body)
-    labels = data.dig('data', 'issueLabels', 'nodes')
+    allLabels = [] 
+    while hasNextPage do
+      variables = {
+        teamId: @team_id,
+        after:,
+        first:,
+      }
 
-    if labels
-      puts "[DEBUG] Fetched #{labels.size} labels from Linear"
-      labels
-    else
-      puts '[ERROR] Failed to fetch labels from Linear'
-      []
-    end
+      response = post(query, variables)
+      log_response(response, 'Fetch Labels')
+
+      data = JSON.parse(response.body)
+      labels = data.dig('data', 'team', 'labels', 'edges').map { |edge| edge['node'] }
+      hasNextPage = data.dig('data', 'team', 'labels', 'pageInfo', 'hasNextPage')
+
+      allLabels.concat(labels)
+
+      if labels
+        puts "[DEBUG] Fetched #{labels.size} labels from Linear"
+      else
+        puts '[ERROR] Failed to fetch labels from Linear'
+      end
+    end 
+
+    return labels
   end
 
   def fetch_team_members
@@ -944,7 +930,6 @@ class LinearClient
 
     variables = { teamId: @team_id }
     response = post(query, variables)
-    # log_response(response, 'Fetch Team Members')
 
     data = JSON.parse(response.body)
     members = data.dig('data', 'team', 'members', 'nodes')
@@ -1036,7 +1021,8 @@ class LinearClient
 
     response = post(mutation, variables)
     data = JSON.parse(response.body)
-    data.dig('data', 'issueLabelCreate', 'issueLabel', 'id')
+
+    data.dig('data', 'issueLabelCreate', 'issueLabel')
   end
 
   # private
@@ -1207,31 +1193,6 @@ class LinearClient
       nil
     end
   end
-
-  def fetch_or_create_label(name)
-    query = <<-GRAPHQL
-        query($teamId: String!) {
-          team(id: $teamId) {
-            labels {
-              nodes {
-                id
-                name
-              }
-            }
-          }
-        }
-    GRAPHQL
-
-    variables = { teamId: @team_id }
-    response = post(query, variables)
-    data = JSON.parse(response.body)
-    labels = data.dig('data', 'team', 'labels', 'nodes')
-
-    existing_label = labels.find { |label| label['name'].downcase == name.downcase }
-    return existing_label['id'] if existing_label
-
-    create_label(name)
-  end
 end
 
 class MigrationManager
@@ -1398,6 +1359,7 @@ class MigrationManager
     # For debugging specific stories
     # stories = stories.select { |story| story['id'] == 186164568 }
     # stories = stories.select { |story| story['id'] == 188115984 }
+    # Tabs issue
     # stories = stories.select { |story| story['id'] == 187478768 }
 
     sorted_stories = stories.sort_by do |story|
@@ -1492,15 +1454,6 @@ class MigrationManager
         end
       end
 
-      # unless @pt_csv_reader.csv_given
-      #   unless story_details['branches'].empty?
-      #     description += "\n\nBranches:\n" + story_details['branches'].map do |branch|
-      #       branch_url = "#{branch['host_url']}#{branch['owner']}/#{branch['repo']}/tree/#{branch['name']}"
-      #       "| [`#{branch['name']}`](#{branch_url})"
-      #     end.join("\n")
-      #   end
-      # end
-
       # I have no words for this one. Took me a while to figure out what was going on.
       if @pt_csv_reader.csv_given
         title = story['title'] # Unlike the API, csv uses 'title' instead of 'name'
@@ -1525,20 +1478,17 @@ class MigrationManager
       if @dry_run
         $logger.info "[DRY RUN] Would create story: '#{story['name']}' with labels: #{label_names.join(', ')}"
       else
-        # linear_issue = create_linear_issue(
-        #   title,
-        #   description,
-        #   label_names,
-        #   story['current_state'],
-        #   previous_issue_id,
-        #   estimate,
-        #   user,
-        #   story_details['labels']
-        # )
         linear_state = PT_TO_LINEAR_STATE[story['current_state']]
         state_id = @linear_client.get_state_id(linear_state)
 
-        label_ids = label_names.map { |name| @linear_client.fetch_or_create_label(name) }.compact
+        label_ids = label_names.map do |name| 
+          if @linear_labels[name.downcase]
+            next @linear_labels[name.downcase]
+          end
+          label = @linear_client.create_label(name)
+          @linear_labels[name.downcase] = label['id'] if label
+          next label['id']
+        end.compact
 
         story_info = {
           title:,
@@ -1549,16 +1499,6 @@ class MigrationManager
           state_id:
         }
         @linear_client.queue_issue_create( story_info)
-        
-        # if linear_issue
-        #   # previous_issue_id = linear_issue['id']
-        #   # link_to_epic(linear_issue['id'], story_details['labels'])
-        #   # migrate_story_comments_and_attachments(story['id'], linear_issue['id'])
-        #   # migrate_story_tasks(story['id'], linear_issue['id'])
-        #   # assign_issue(linear_issue['id'], last_assigned) unless last_assigned == 'Unassigned'
-        # else
-        #   $logger.error "Failed to create story in Linear: #{story['name']}"
-        # end
       end
     end
     @linear_client.queue_issue_create_process
@@ -1790,16 +1730,6 @@ class MigrationManager
       @linear_team_members.find { |member| member['name'] == name }
   end
 
-  def get_linear_label_id(label_name)
-    @linear_labels[label_name.downcase] || create_linear_label(label_name)
-  end
-
-  def create_linear_label(label_name)
-    label_id = @linear_client.create_label(label_name)
-    @linear_labels[label_name.downcase] = label_id
-    label_id
-  end
-
   def migrate_comments(id, linear_id, type)
     $logger.debug "Starting to migrate comments for #{type} #{id}"
     comments = type == :epic ? @pt_client.fetch_epic_comments(id) : @pt_client.fetch_story_comments(id)
@@ -1968,31 +1898,6 @@ class MigrationManager
       @linear_client.link_issue_to_project(linear_issue_id, linear_project_id)
       $logger.info "Linked issue #{linear_issue_id} to project #{linear_project_id}"
       break # Link to the first matching project
-    end
-  end
-
-  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id, estimate, assigneeUser, labels)
-    linear_state = PT_TO_LINEAR_STATE[pt_state]
-    state_id = @linear_client.get_state_id(linear_state)
-
-    if @dry_run
-      $logger.info "[DRY RUN] Would create issue: '#{title}' with state: #{linear_state}"
-      nil
-    else
-      issue = @linear_client.create_issue(title, description, label_names, estimate, assigneeUser)
-
-      if issue
-        @linear_client.update_issue(issue['id'], { stateId: state_id }) if state_id
-
-        if previous_issue_id
-          previous_issue = @linear_client.get_issue(previous_issue_id)
-          if previous_issue
-            new_sort_order = previous_issue['sortOrder'].to_f + 1
-            @linear_client.update_issue(issue['id'], { sortOrder: new_sort_order })
-          end
-        end
-      end
-      issue
     end
   end
 
