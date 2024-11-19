@@ -355,13 +355,69 @@ class LinearClient
 
     @issue_create_queue = []
     @issue_create_batch = 100
+
+    @comments_create_queue = []
+    @comments_create_batch = 100
+
+    @pt_to_linear_mapping = {}
+  end
+
+  def queue_comment_create(comment_info)
+    @comments_create_queue << comment_info
+  end
+  def queue_comment_create_process()
+    query = <<-GRAPHQL
+      mutation(%s){
+        %s
+      }
+    GRAPHQL
+
+    puts "Batching #{@comments_create_batch} comments in one request"
+    @comments_create_queue.each_slice(@comments_create_batch) do |batch|
+      mutations = batch.each_with_index.map do |comment_info, index|
+      <<-GRAPHQL
+        c#{index}: commentCreate(input: $input#{index}) {
+          success
+          comment {
+            id
+          }
+        }
+      GRAPHQL
+      end.join("\n")
+
+      inputs = batch.each_with_index.map do |comment_info, index|
+      <<-GRAPHQL
+        $input#{index}: CommentCreateInput!
+      GRAPHQL
+      end.join(",\n")
+
+      query_with_mutations = query % [inputs, mutations]
+      
+      variables = batch.each_with_index.map do |comment_info, index|
+        inputHash = {
+          issueId: @pt_to_linear_mapping[comment_info[:story_id].to_s],
+          body: comment_info[:comment]
+        }
+
+        ["input#{index}".to_sym, inputHash]
+      end.to_h
+
+      response = post(query_with_mutations, variables)
+
+      # log_response(response, 'Create Comment Batch')
+      body = JSON.parse(response.body)
+      body["data"].each do |key, value|
+        if value['success'] != true
+          puts "Failed to create comment for batch item: #{key}"
+        end
+      end
+    end
   end
 
   # For creating issues in batches
   def queue_issue_create(story_info)
     @issue_create_queue << story_info
   end
-
   def queue_issue_create_process()
     query = <<-GRAPHQL
       mutation(%s){
@@ -373,15 +429,16 @@ class LinearClient
       mutations = batch.each_with_index.map do |story_info, index|
       <<-GRAPHQL
         s#{index}: issueCreate(input: $input#{index}) {
-        success
-        issue {
-          id
-          title
-        }
+          success
+          issue {
+            id
+            description
+          }
         }
       GRAPHQL
       end.join("\n")
 
+      puts "Batching #{@issue_create_batch} issues in one request"
       inputs = batch.each_with_index.map do |story_info, index|
       <<-GRAPHQL
         $input#{index}: IssueCreateInput!
@@ -416,13 +473,21 @@ class LinearClient
       puts "VARIABLES"
       puts variables
       response = post(query_with_mutations, variables)
-      log_response(response, 'Create Issue Batch')
+      # log_response(response, 'Create Issue Batch')
       body = JSON.parse(response.body)
 
       body["data"].each do |key, value|
         print "Key: #{key} Value: #{value}"
         if value['success'] == true
-          puts "Successfully created issue: #{value['issue']['title']} (ID: #{value['issue']['id']})"
+          linear_id = value['issue']['id']
+          match_data = value['issue']['description'].match(/Pivotal Story: \[https:\/\/www\.pivotaltracker\.com\/story\/show\/(\d+)\]\(https:\/\/www\.pivotaltracker\.com\/story\/show\/\d+\)/)
+          if match_data
+            pt_id = match_data[1]
+          else
+            puts "Failed to extract Pivotal Tracker ID from description"
+            exit(0)
+          end 
+          @pt_to_linear_mapping[pt_id] = linear_id
         else
           puts "Failed to create issue for batch item: #{key}"
         end
@@ -1360,7 +1425,7 @@ class MigrationManager
     # stories = stories.select { |story| story['id'] == 186164568 }
     # stories = stories.select { |story| story['id'] == 188115984 }
     # Tabs issue
-    # stories = stories.select { |story| story['id'] == 187478768 }
+    # stories = stories.select { |story| [187478768, 188115984].include?(story['id']) }
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
@@ -1467,11 +1532,7 @@ class MigrationManager
       label_names << 'migrated_story'
       label_names.uniq!
 
-      commentsBody = comments_for_description(story['id'])
-      unless commentsBody.empty?
-        description += "\n\n---\n# PT Comments:\n"
-        description += commentsBody
-      end
+      commentsBody = queue_comments_for_story(story['id'])
 
       user = find_matching_user(last_assigned)
 
@@ -1501,10 +1562,13 @@ class MigrationManager
         @linear_client.queue_issue_create( story_info)
       end
     end
+    puts "Processing issues queue"
     @linear_client.queue_issue_create_process
+    puts "Processing comments queue"
+    @linear_client.queue_comment_create_process
   end
 
-  def comments_for_description(story_id)
+  def queue_comments_for_story(story_id)
     if @pt_csv_reader.csv_given
       # puts "Checking if story #{story_id} has attachments"
       if @pt_csv_reader.is_story_with_attachments?(story_id.to_s)
@@ -1522,14 +1586,15 @@ class MigrationManager
     # puts "Comments: #{comments.inspect}"
 
     if comments.empty?
-      return ''
+      return
     end
 
-    commentBodies = comments.map do |comment|
-      create_text_for_comment(comment)
+    comments.map do |comment|
+      @linear_client.queue_comment_create({
+        story_id: story_id,
+        comment: create_text_for_comment(comment)
+      })
     end
-
-    "\n"+commentBodies.join("\n---\n")
   end
 
   def create_text_for_comment(comment)
@@ -1728,65 +1793,6 @@ class MigrationManager
 
     @linear_team_members.find { |member| member['email'] == email } ||
       @linear_team_members.find { |member| member['name'] == name }
-  end
-
-  def migrate_comments(id, linear_id, type)
-    $logger.debug "Starting to migrate comments for #{type} #{id}"
-    comments = type == :epic ? @pt_client.fetch_epic_comments(id) : @pt_client.fetch_story_comments(id)
-    $logger.debug "Fetched #{comments.size} comments for #{type} #{id}"
-
-    if comments.empty?
-      $logger.info "No comments found for #{type} #{id}"
-    else
-      comments.each_with_index do |comment, index|
-        $logger.debug "Processing comment #{index + 1} of #{comments.size} for #{type} #{id}"
-        process_comment(comment, linear_id)
-      end
-    end
-  end
-
-  def process_comment(comment, linear_id)
-    $logger.debug "Starting to process comment: #{comment['id']}"
-    person_id = comment['person_id']
-    $logger.debug "Fetching person info for person_id: #{person_id}"
-    membership = @pt_client.fetch_person(person_id)
-
-    if membership
-      person_info = membership['person']
-      author_name = person_info['name']
-      author_email = person_info['email']
-
-      body = "Comment by #{author_name} <#{author_email}>:\n\n#{comment['text']}"
-
-      attachments = []
-      comment['file_attachments']&.each do |attachment|
-        attachment_result = process_attachment(attachment)
-        attachments << attachment_result if attachment_result
-      end
-
-      if @dry_run
-        $logger.info "[DRY RUN] Would create comment: '#{body[0..50]}...'"
-        if attachments.any?
-          $logger.info "[DRY RUN] Would create attachments: #{attachments.map { |a| a[:filename] }.join(', ')}"
-        end
-      else
-        $logger.debug 'Creating comment with attachments in Linear'
-        linear_comment = @linear_client.create_comment_with_attachments(linear_id, body, attachments)
-        if linear_comment
-          $logger.debug "Successfully created comment with attachments: ID #{linear_comment['id']}"
-          $logger.debug 'Comment body:'
-          $logger.debug linear_comment['body']
-        else
-          $logger.error 'Failed to create comment with attachments in Linear'
-        end
-      end
-    else
-      $logger.warn "Could not find person information for comment by person_id: #{person_id}"
-    end
-  rescue StandardError => e
-    $logger.error "Failed to process comment: #{e.message}"
-    $logger.debug "Comment structure: #{comment.inspect}"
-    $logger.debug e.backtrace.join("\n")
   end
 
   def get_pt_comment_author(person_id)
