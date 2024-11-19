@@ -357,7 +357,7 @@ class LinearClient
     @issue_create_batch = 100
 
     @comments_create_queue = []
-    @comments_create_batch = 100
+    @comments_create_batch = 20
 
     @pt_to_linear_mapping = {}
   end
@@ -392,6 +392,10 @@ class LinearClient
       end.join(",\n")
 
       query_with_mutations = query % [inputs, mutations]
+
+      # puts "Batching #{@comments_create_batch} comments in one request"
+      # puts "Query with mutations"
+      # puts query_with_mutations
       
       variables = batch.each_with_index.map do |comment_info, index|
         inputHash = {
@@ -402,9 +406,12 @@ class LinearClient
         ["input#{index}".to_sym, inputHash]
       end.to_h
 
+      puts "VARIABLES"
+      puts variables
+
       response = post(query_with_mutations, variables)
 
-      # log_response(response, 'Create Comment Batch')
+      log_response(response, 'Create Comment Batch')
       body = JSON.parse(response.body)
       body["data"].each do |key, value|
         if value['success'] != true
