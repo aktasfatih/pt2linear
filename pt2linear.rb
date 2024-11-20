@@ -365,6 +365,41 @@ class LinearClient
   def queue_comment_create(comment_info)
     @comments_create_queue << comment_info
   end
+
+  def gather_comments_at_level(level)
+    commentsAtLevel = [] 
+    current_level = 0
+    last_issue = nil
+    @comments_create_queue.each do |comment_info|
+      issue_id = @pt_to_linear_mapping[comment_info[:story_id].to_s]
+      if last_issue != issue_id
+        current_level = 0
+        last_issue = issue_id
+        if current_level == level
+          commentsAtLevel.push(comment_info)
+        end
+      elsif current_level == level
+        commentsAtLevel.push(comment_info)
+      end
+      current_level += 1
+    end
+    commentsAtLevel
+  end
+
+  def gather_comments_at_all_levels()
+    commentsAtAllLevels = []
+    current_level = 0
+    gathered = 0
+    while gathered < @comments_create_queue.length
+      commentsAtLevel = gather_comments_at_level(current_level)
+      puts "Gathered #{commentsAtLevel.length} comments at level #{current_level}"
+      commentsAtAllLevels.push(commentsAtLevel)
+      gathered += commentsAtLevel.length
+      current_level += 1
+    end
+    commentsAtAllLevels
+  end
+
   def queue_comment_create_process()
     query = <<-GRAPHQL
       mutation(%s){
@@ -372,50 +407,52 @@ class LinearClient
       }
     GRAPHQL
 
-    puts "Batching #{@comments_create_batch} comments in one request"
-    @comments_create_queue.each_slice(@comments_create_batch) do |batch|
-      mutations = batch.each_with_index.map do |comment_info, index|
-      <<-GRAPHQL
-        c#{index}: commentCreate(input: $input#{index}) {
-          success
-          comment {
-            id
+    gatherCommentLevels = gather_comments_at_all_levels
+    for comments in gatherCommentLevels
+      comments.each_slice(@comments_create_batch) do |batch|
+        mutations = batch.each_with_index.map do |comment_info, index|
+        <<-GRAPHQL
+          c#{index}: commentCreate(input: $input#{index}) {
+            success
+            comment {
+              id
+            }
           }
-        }
-      GRAPHQL
-      end.join("\n")
+        GRAPHQL
+        end.join("\n")
 
-      inputs = batch.each_with_index.map do |comment_info, index|
-      <<-GRAPHQL
-        $input#{index}: CommentCreateInput!
-      GRAPHQL
-      end.join(",\n")
+        inputs = batch.each_with_index.map do |comment_info, index|
+        <<-GRAPHQL
+          $input#{index}: CommentCreateInput!
+        GRAPHQL
+        end.join(",\n")
 
-      query_with_mutations = query % [inputs, mutations]
+        query_with_mutations = query % [inputs, mutations]
 
-      # puts "Batching #{@comments_create_batch} comments in one request"
-      # puts "Query with mutations"
-      # puts query_with_mutations
-      
-      variables = batch.each_with_index.map do |comment_info, index|
-        inputHash = {
-          issueId: @pt_to_linear_mapping[comment_info[:story_id].to_s],
-          body: comment_info[:comment]
-        }
+        # puts "Batching #{@comments_create_batch} comments in one request"
+        # puts "Query with mutations"
+        # puts query_with_mutations
+        
+        variables = batch.each_with_index.map do |comment_info, index|
+          inputHash = {
+            issueId: @pt_to_linear_mapping[comment_info[:story_id].to_s],
+            body: comment_info[:comment]
+          }
 
-        ["input#{index}".to_sym, inputHash]
-      end.to_h
+          ["input#{index}".to_sym, inputHash]
+        end.to_h
 
-      puts "VARIABLES"
-      puts variables
+        puts "VARIABLES"
+        puts variables
 
-      response = post(query_with_mutations, variables)
+        response = post(query_with_mutations, variables)
 
-      log_response(response, 'Create Comment Batch')
-      body = JSON.parse(response.body)
-      body["data"].each do |key, value|
-        if value['success'] != true
-          puts "Failed to create comment for batch item: #{key}"
+        log_response(response, 'Create Comment Batch')
+        body = JSON.parse(response.body)
+        body["data"].each do |key, value|
+          if value['success'] != true
+            puts "Failed to create comment for batch item: #{key}"
+          end
         end
       end
     end
@@ -445,7 +482,7 @@ class LinearClient
       GRAPHQL
       end.join("\n")
 
-      puts "Batching #{@issue_create_batch} issues in one request"
+      # puts "Batching #{@issue_create_batch} issues in one request"
       inputs = batch.each_with_index.map do |story_info, index|
       <<-GRAPHQL
         $input#{index}: IssueCreateInput!
@@ -1432,7 +1469,7 @@ class MigrationManager
     # stories = stories.select { |story| story['id'] == 186164568 }
     # stories = stories.select { |story| story['id'] == 188115984 }
     # Tabs issue
-    # stories = stories.select { |story| [187478768, 188115984].include?(story['id']) }
+    # stories = stories.select { |story| [187478768, 188115984, 187772789].include?(story['id']) }
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
