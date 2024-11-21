@@ -439,6 +439,10 @@ class LinearClient
             body: comment_info[:comment]
           }
 
+          unless comment_info[:subscriberIds].nil?
+            inputHash["subscriberIds"] = comment_info[:subscriberIds].uniq
+          end
+
           ["input#{index}".to_sym, inputHash]
         end.to_h
 
@@ -499,12 +503,20 @@ class LinearClient
           stateId: story_info[:state_id]
         }
 
+        subscriberIds = [
+          story_info.dig(:requestedByToLinearUser, 'id'),
+          story_info.dig(:ownerToLinearUser, 'id'),
+        ].compact.select{ |id| !id.nil? }
+        unless subscriberIds.empty?
+          inputHash["subscriberIds"] = subscriberIds.uniq
+        end
+
         unless story_info[:label_ids].empty?
           inputHash["labelIds"] = story_info[:label_ids]
         end
 
-        unless story_info[:user].nil?
-          inputHash["assigneeId"] = story_info[:user]['id'].to_s
+        unless story_info[:ownerToLinearUser].nil?
+          inputHash["assigneeId"] = story_info[:ownerToLinearUser]['id'].to_s
         end
 
         if story_info[:estimate]!= "Unestimated"
@@ -517,7 +529,7 @@ class LinearClient
       puts "VARIABLES"
       puts variables
       response = post(query_with_mutations, variables)
-      # log_response(response, 'Create Issue Batch')
+      log_response(response, 'Create Issue Batch')
       body = JSON.parse(response.body)
 
       body["data"].each do |key, value|
@@ -1495,7 +1507,7 @@ class MigrationManager
       if @pt_csv_reader.csv_given
         story_details = @pt_csv_reader.find_by_pivotal_tracker_id(story['id'])
         last_assigned = story_details['owned_by'] || 'Unassigned'
-        requested_by = story_details['requested_by']
+        requested_by = story_details['requested_by'] || 'Unassigned'
       else
         story_details = @pt_client.fetch_story_details(story['id'])
         last_assigned = if story_details['owner_ids'] && !story_details['owner_ids'].empty?
@@ -1579,7 +1591,8 @@ class MigrationManager
 
       commentsBody = queue_comments_for_story(story['id'])
 
-      user = find_matching_user(last_assigned)
+      ownerToLinearUser = find_matching_user(last_assigned)
+      requestedByToLinearUser = find_matching_user(requested_by)
 
       if @dry_run
         $logger.info "[DRY RUN] Would create story: '#{story['name']}' with labels: #{label_names.join(', ')}"
@@ -1601,7 +1614,8 @@ class MigrationManager
           description:,
           label_ids:,
           estimate:,
-          user:,
+          ownerToLinearUser:,
+          requestedByToLinearUser:,
           state_id:
         }
         @linear_client.queue_issue_create( story_info)
@@ -1635,10 +1649,15 @@ class MigrationManager
     end
 
     comments.map do |comment|
-      @linear_client.queue_comment_create({
+      full_body, subscriberIds = create_text_for_comment(comment)
+      input = {
         story_id: story_id,
-        comment: create_text_for_comment(comment)
-      })
+        comment: full_body,
+      }
+      unless subscriberIds.nil?
+        input["subscriber_ids"] = subscriberIds
+      end
+      @linear_client.queue_comment_create(input)
     end
   end
 
@@ -1689,6 +1708,13 @@ class MigrationManager
     end.join("\n\n")
 
     full_body = "#{body}\n\n#{attachment_markdown}"
+
+    unless linearUser.nil?
+      subscriberIds = [
+        linearUser["id"]
+      ]
+    end
+    [full_body, subscriberIds]
   end
 
   def migrate_story_comments_and_attachments(story_id, linear_issue_id)
