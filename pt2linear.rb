@@ -203,8 +203,16 @@ class PivotalTrackerClient
     story['attachments'] || []
   end
 
+  def fetch_all_projects
+    get '/projects'
+  end
+
   def fetch_all_project_members
     get("/projects/#{@project_id}/memberships")
+  end
+
+  def fetch_all_project_members2(project_id)
+    get("/projects/#{project_id}/memberships")
   end
 
   def fetch_person(person_id)
@@ -354,7 +362,7 @@ class LinearClient
     @already_migrated_epics = find_all_pt_epics_from_linear
 
     @issue_create_queue = []
-    @issue_create_batch = 100
+    @issue_create_batch = 40
 
     @comments_create_queue = []
     @comments_create_batch = 20
@@ -1036,14 +1044,16 @@ class LinearClient
 
   def fetch_team_members
     query = <<-GRAPHQL
-        query($teamId: String!) {
-          team(id: $teamId) {
-            members {
-              nodes {
-                id
-                name
-                email
-                displayName
+        query {
+          teams(first: 20) {
+            nodes {
+              members(first: 200) {
+                nodes {
+                  id
+                  name
+                  email
+                  displayName
+                }
               }
             }
           }
@@ -1052,9 +1062,10 @@ class LinearClient
 
     variables = { teamId: @team_id }
     response = post(query, variables)
-
     data = JSON.parse(response.body)
-    members = data.dig('data', 'team', 'members', 'nodes')
+    members = data.dig('data', 'teams', 'nodes').flat_map { |team| team.dig('members', 'nodes') }
+
+    puts "[DEBUG] Team members: #{members.map { |m| m['name'] }}"
 
     if members
       puts "[DEBUG] Fetched #{members.size} team members from Linear"
@@ -1395,10 +1406,18 @@ class MigrationManager
   end
 
   def load_team_members
-    @pt_team_members = @pt_client.fetch_all_project_members.map do |member|
-      [member['person']['id'], member['person']]
-    end.to_h
+    projects = @pt_client.fetch_all_projects
+    for project in projects
+      puts "Project: #{project['name']}"
+      project_id = project['id']
+      pt_team_members = @pt_client.fetch_all_project_members2(project_id).map do |member|
+        [member['person']['id'], member['person']]
+      end.to_h
+      puts "PT Team Members: #{pt_team_members}"
+      @pt_team_members.merge!(pt_team_members)
+    end
     $logger.debug "Loaded #{@pt_team_members.size} team members from Pivotal Tracker"
+    puts "ALL PT Team Members: #{@pt_team_members}"
 
     @linear_team_members = @linear_client.fetch_team_members
     $logger.debug "Loaded #{@linear_team_members.size} team members from Linear"
@@ -1480,7 +1499,7 @@ class MigrationManager
 
     # For debugging specific stories
     # stories = stories.select { |story| story['id'] == 186164568 }
-    # stories = stories.select { |story| story['id'] == 188115984 }
+    # stories = stories.select { |story| story['id'] == 188369021 }
     # Tabs issue
     # stories = stories.select { |story| [187478768, 188115984, 187772789].include?(story['id']) }
 
@@ -1681,8 +1700,8 @@ class MigrationManager
       linearUser = find_matching_user(author_name)
     end
 
-    displayName = " - @#{linearUser["displayName"]} - " if linearUser != nil
-    body = "Comment by #{author_name}#{displayName}[#{date}]:\n\n#{comment['text']}"
+    displayName = "- @#{linearUser["displayName"]} - " if linearUser != nil
+    body = "Comment by #{author_name} #{displayName}on #{date}:\n\n#{comment['text']}"
 
     # puts "Processing attachments"
     if @pt_csv_reader.csv_given
@@ -1707,13 +1726,37 @@ class MigrationManager
       end
     end.join("\n\n")
 
-    full_body = "#{body}\n\n#{attachment_markdown}"
+    subscriber_ids = [
+      linearUser.nil? ? nil : linearUser["id"]
+    ]
+    for pt_user in @pt_team_members
+      puts "Checking for user: " + pt_user[1]["username"]
+      pt_username = pt_user[1]["username"]
 
-    unless linearUser.nil?
-      subscriberIds = [
-        linearUser["id"]
-      ]
+      linearUserComment = find_matching_user(pt_user[1]["name"])
+      if linearUserComment.nil?
+        puts "no linear user found for " + pt_user[1]["name"]
+        next
+      end
+      linear_username = linearUserComment["displayName"]
+
+      puts body
+      if body.include?(pt_username)
+        puts "FOUND " + pt_username
+        puts "Replacing with " + linear_username
+        subscriber_ids.push(linearUserComment["id"])
+        body = body.gsub("@" + pt_username, "@" + linear_username)
+      end
     end
+
+    full_body = "#{body}\n\n#{attachment_markdown}"
+    puts "Full body: #{full_body}"
+
+    subscriber_ids = subscriber_ids.compact
+    if subscriber_ids.empty?
+      subscriberIds = nil
+    end
+
     [full_body, subscriberIds]
   end
 
@@ -1759,7 +1802,7 @@ class MigrationManager
     end
 
 
-    body = "Comment by #{author_name} [#{date}]:\n\n#{comment['text']}"
+    body = "Comment by #{author_name} on #{date}:\n\n#{comment['text']}"
 
     puts "Processing attachments"
     if @pt_csv_reader.csv_given
