@@ -1031,6 +1031,7 @@ class LinearClient
                 id
                 name
                 email
+                displayName
               }
             }
           }
@@ -1646,8 +1647,7 @@ class MigrationManager
       # puts "Taking author,date from csv"
       author_name = comment['author']
       date = comment['date']
-      # puts "Author: #{author_name}, Date: #{date}"
-      # puts "Comment: #{comment['text']}"
+      linearUser = find_matching_user(author_name)
     else
       # puts "Taking author,date from api" 
       person_id = comment['person_id']
@@ -1659,9 +1659,11 @@ class MigrationManager
       author_name = person_info['name']
       created_at = comment['created_at']
       date = Time.parse(created_at).strftime("%b %d, %Y")
+      linearUser = find_matching_user(author_name)
     end
 
-    body = "Comment by #{author_name} [#{date}]:\n\n#{comment['text']}"
+    displayName = " - @#{linearUser["displayName"]} - " if linearUser != nil
+    body = "Comment by #{author_name}#{displayName}[#{date}]:\n\n#{comment['text']}"
 
     # puts "Processing attachments"
     if @pt_csv_reader.csv_given
