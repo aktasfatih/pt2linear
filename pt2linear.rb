@@ -1007,6 +1007,7 @@ class LinearClient
         issueEstimationExtended: true,
         issueEstimationAllowZero: true,
         defaultIssueEstimate: 0,
+        triageEnabled: true,
       }
     }
 
