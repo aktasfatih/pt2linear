@@ -578,7 +578,21 @@ class LinearClient
     if team
       puts "[DEBUG] Found team '#{team_name}' with ID: #{team['id']}"
     else
-      puts "[ERROR] Team '#{team_name}' not found!"
+      # Create team if it doesn't exist
+      query = <<-GRAPHQL
+        mutation {
+          teamCreate(input: { name: "#{team_name}" }) {
+            success
+            team {
+              id
+            }
+          }
+        }
+      GRAPHQL
+
+      response = post(query)
+      data = JSON.parse(response.body)
+      team = data['data']['teamCreate']['team']
     end
     team['id']
   end
