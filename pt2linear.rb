@@ -991,6 +991,37 @@ class LinearClient
     data.dig('data', 'issueUpdate', 'success')
   end
 
+  def set_team_settings
+    query = <<-GRAPHQL
+        mutation($input: TeamUpdateInput!, $teamUpdateId: String!){
+          teamUpdate(input: $input, id: $teamUpdateId) {
+            success
+          }
+        }
+    GRAPHQL
+
+    variables = {
+      teamUpdateId: @team_id,
+      input: {
+        issueEstimationType: 'linear',
+        issueEstimationExtended: true,
+        issueEstimationAllowZero: true,
+        defaultIssueEstimate: 0,
+      }
+    }
+
+    response = post(query, variables)
+    log_response(response, 'Set Team Settings')
+    data = JSON.parse(response.body)
+    success = data.dig('data', 'teamUpdate', 'success')
+
+    if success
+      puts '[DEBUG] Successfully set team settings in Linear'
+    else
+      puts '[ERROR] Failed to set team settings in Linear'
+    end
+  end
+
   def fetch_labels
     query = <<-GRAPHQL
       query($teamId: String!, $after: String, $first: Int){
@@ -1042,28 +1073,83 @@ class LinearClient
     return labels
   end
 
+  def add_all_users_to_team
+    # Get all the users in the workspace
+    query = <<-GRAPHQL
+        query {
+          users(first: 200) {
+            nodes {
+              id
+              name
+              email
+              displayName
+            }
+          }
+        }
+    GRAPHQL
+    response = post(query)
+    data = JSON.parse(response.body)
+    allUsers = data.dig('data', 'users', 'nodes')
+
+    # This is not the final one.
+    teamMembers = fetch_team_members
+
+    puts "[DEBUG] # of all users: #{allUsers.size}"
+
+    missingIDs = allUsers.map { |user| user['id'] } - teamMembers.map { |member| member['id'] }
+
+    mutations = missingIDs.each_with_index.map do |id, index|
+      <<-GRAPHQL
+        u#{index}: teamMembershipCreate(input: { teamId: "#{@team_id}", userId: "#{id}" }) {
+          success
+        }
+      GRAPHQL
+    end.join("\n")
+
+    query = <<-GRAPHQL
+      mutation {
+        %s
+      }
+    GRAPHQL
+
+    query_with_mutations = query % [mutations]
+
+    puts "Query with mutations"
+    puts query_with_mutations
+
+    response = post(query_with_mutations)
+    log_response(response, 'Add All Users to Team')
+
+    data = JSON.parse(response.body)
+    data.each do |key, value|
+      if value['success'] != true
+        puts "Failed to add user to team for batch item: #{key}"
+      end
+    end
+
+    allUsers
+  end
+
   def fetch_team_members
     query = <<-GRAPHQL
         query {
-          teams(first: 20) {
-            nodes {
-              members(first: 200) {
-                nodes {
-                  id
-                  name
-                  email
-                  displayName
-                }
+          team(id: "#{@team_id}") {
+            members(first: 200) {
+              nodes {
+                id
+                name
+                email
+                displayName
               }
             }
           }
         }
     GRAPHQL
 
-    variables = { teamId: @team_id }
-    response = post(query, variables)
+    response = post(query)
+    log_response(response, 'Fetch Team Members')
     data = JSON.parse(response.body)
-    members = data.dig('data', 'teams', 'nodes').flat_map { |team| team.dig('members', 'nodes') }
+    members = data.dig('data', 'team', 'members', 'nodes')
 
     puts "[DEBUG] Team members: #{members.map { |m| m['name'] }}"
 
@@ -1364,7 +1450,8 @@ class MigrationManager
   def migrate
     fetch_linear_labels
     create_epic_mappings
-    load_team_members
+    set_team_settings
+    load_team_members # adds all workspace users to the team
     migrate_epics
     fetch_linear_labels # refetch after migrating epics
     migrate_stories
@@ -1376,6 +1463,12 @@ class MigrationManager
   end
 
   private
+
+  # We want the teams to have estimates enabled. We use Linear estimates and extended up to 20.
+  def set_team_settings
+    @linear_client.set_team_settings
+  end
+
 
   def get_state_id(name)
     state = @workflow_states.find { |s| s['name'] == name }
@@ -1419,8 +1512,10 @@ class MigrationManager
     $logger.debug "Loaded #{@pt_team_members.size} team members from Pivotal Tracker"
     puts "ALL PT Team Members: #{@pt_team_members}"
 
-    @linear_team_members = @linear_client.fetch_team_members
-    $logger.debug "Loaded #{@linear_team_members.size} team members from Linear"
+    # @linear_team_members = @linear_client.fetch_team_members
+    # $logger.debug "Loaded #{@linear_team_members.size} team members from Linear"
+
+    @linear_team_members = @linear_client.add_all_users_to_team
   end
 
   def migrate_epics
