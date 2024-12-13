@@ -1075,17 +1075,18 @@ class LinearClient
       data = JSON.parse(response.body)
       labels = data.dig('data', 'team', 'labels', 'edges').map { |edge| edge['node'] }
       hasNextPage = data.dig('data', 'team', 'labels', 'pageInfo', 'hasNextPage')
+      after = data.dig('data', 'team', 'labels', 'pageInfo', 'endCursor')
 
-      allLabels.concat(labels)
 
       if labels
         puts "[DEBUG] Fetched #{labels.size} labels from Linear"
+        allLabels = allLabels.concat(labels)
       else
         puts '[ERROR] Failed to fetch labels from Linear'
       end
     end 
 
-    return labels
+    return allLabels
   end
 
   def add_all_users_to_team
@@ -1112,6 +1113,10 @@ class LinearClient
     puts "[DEBUG] # of all users: #{allUsers.size}"
 
     missingIDs = allUsers.map { |user| user['id'] } - teamMembers.map { |member| member['id'] }
+
+    if missingIDs.empty?
+      return allUsers
+    end
 
     mutations = missingIDs.each_with_index.map do |id, index|
       <<-GRAPHQL
@@ -1254,6 +1259,8 @@ class LinearClient
     }
 
     response = post(mutation, variables)
+    log_response(response, 'Create Label')
+
     data = JSON.parse(response.body)
 
     data.dig('data', 'issueLabelCreate', 'issueLabel')
