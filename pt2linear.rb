@@ -73,6 +73,7 @@ class PivotalCSVParser
           reviews = []
           blockers = []
           pull_requests = []
+          owned_by = []
           (0..@headers.length).each do |j|
               # Handling comments
               if @headers[j].to_s == 'comment' && row[j] != nil
@@ -84,6 +85,12 @@ class PivotalCSVParser
                       comments << { 'story_id' => id, 'text' => row[j], 'author' => nil, 'date' => nil }
                       $logger.error "Comment without author and date: #{row[j]}"
                   end
+                  next
+              end
+
+              # Handling owned_by
+              if @headers[j].to_s == 'owned_by' && row[j] != nil
+                  owned_by << row[j]
                   next
               end
 
@@ -139,6 +146,7 @@ class PivotalCSVParser
           structured_data[id]['reviews'] = reviews
           structured_data[id]['blockers'] = blockers
           structured_data[id]['pull_requests'] = pull_requests
+          structured_data[id]['owned_by'] = owned_by
       end
       structured_data
   end
@@ -1620,6 +1628,9 @@ class MigrationManager
     # Tabs issue
     # stories = stories.select { |story| [187478768, 188115984, 187772789].include?(story['id']) }
 
+    # stories = stories.select { |story| story['id'] == 147268199 } # patric
+    # stories = stories.select { |story| story['id'] == 188559510 } # not imported accepted
+
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
     end
@@ -1640,9 +1651,10 @@ class MigrationManager
       #   next
       # end
 
+
       if @pt_csv_reader.csv_given
         story_details = @pt_csv_reader.find_by_pivotal_tracker_id(story['id'])
-        last_assigned = story_details['owned_by'] || 'Unassigned'
+        last_assigned = story_details['owned_by'].last || 'Unassigned'
         requested_by = story_details['requested_by'] || 'Unassigned'
       else
         story_details = @pt_client.fetch_story_details(story['id'])
@@ -1656,7 +1668,9 @@ class MigrationManager
         requested_by = get_pt_comment_author(story_details['requested_by_id'])
       end
 
-      description = "#{story_details['description']}\n\n---\nPivotal Story: #{pt_link}\nOwner: #{last_assigned}\nRequested by: #{requested_by}"
+      owners = story_details['owned_by'] ? story_details['owned_by'].map { |owner| owner }.join(', ') : 'Unassigned'
+      description = "#{story_details['description']}\n\n---\nPivotal Story: #{pt_link}\n"
+      description += "Owner: #{owners}\nRequested by: #{requested_by}"
 
       if @pt_csv_reader.csv_given
         description += "\nPull Requests: " 
