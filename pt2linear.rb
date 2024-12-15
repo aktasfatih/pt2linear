@@ -16,7 +16,8 @@ require 'enumerator'
 require "csv"
 
 $logger = Logger.new($stdout)
-$logger.level = Logger::INFO
+# $logger.level = Logger::INFO
+$logger.level = Logger::DEBUG
 
 class PivotalCSVParser
   attr_reader :structured_data
@@ -378,6 +379,20 @@ class LinearClient
     @pt_to_linear_mapping = {}
   end
 
+  def save_mapping_to_file
+    team_name = ENV['LINEAR_TEAM_NAME']
+    dir_path = "pt_to_linear"
+    file_path = "#{dir_path}/#{team_name}.json"
+
+    puts "Saving PT to Linear mapping to file: #{file_path}"
+    
+    Dir.mkdir(dir_path) unless Dir.exist?(dir_path)
+    
+    File.open(file_path, 'w') do |file|
+      file.write(JSON.pretty_generate(@pt_to_linear_mapping))
+    end
+  end
+
   def queue_comment_create(comment_info)
     @comments_create_queue << comment_info
   end
@@ -462,11 +477,10 @@ class LinearClient
           ["input#{index}".to_sym, inputHash]
         end.to_h
 
-        puts "VARIABLES"
-        puts variables
+        $logger.info "Request variables"
+        $logger.info variables
 
         response = post(query_with_mutations, variables)
-
         log_response(response, 'Create Comment Batch')
         body = JSON.parse(response.body)
         body["data"].each do |key, value|
@@ -483,13 +497,24 @@ class LinearClient
     @issue_create_queue << story_info
   end
   def queue_issue_create_process()
+    puts "Queue Issue Create Process"
+    puts "length of issue create queue #{@issue_create_queue.length}"
+
     query = <<-GRAPHQL
       mutation(%s){
         %s
       }
     GRAPHQL
 
+    count = 0
     @issue_create_queue.each_slice(@issue_create_batch) do |batch|
+      count += 1
+    end
+    puts "Number of batches: #{count}"
+
+    @issue_create_queue.each_slice(@issue_create_batch) do |batch|
+      puts "Batching #{batch.length} issues in one request"
+
       mutations = batch.each_with_index.map do |story_info, index|
       <<-GRAPHQL
         s#{index}: issueCreate(input: $input#{index}) {
@@ -542,6 +567,9 @@ class LinearClient
         ["input#{index}".to_sym, inputHash]
       end.to_h
 
+      puts "QUERY WITH MUTATIONS"
+      puts query_with_mutations
+
       puts "VARIABLES"
       puts variables
       response = post(query_with_mutations, variables)
@@ -553,9 +581,15 @@ class LinearClient
         if value['success'] == true
           linear_id = value['issue']['id']
           match_data = value['issue']['description'].match(/Pivotal Story: \[https:\/\/www\.pivotaltracker\.com\/story\/show\/(\d+)\]\(https:\/\/www\.pivotaltracker\.com\/story\/show\/\d+\)/)
+          # There is a weird bug where the markdown link is not being parsed correctly
+          # So the links are just found as text.
+          if match_data.nil?
+            match_data = value['issue']['description'].match(/Pivotal Story: https:\/\/www\.pivotaltracker\.com\/story\/show\/(\d+)/)
+          end
           if match_data
             pt_id = match_data[1]
           else
+            puts "ENDED WITH ERROR"
             puts "Failed to extract Pivotal Tracker ID from description"
             exit(0)
           end 
@@ -564,6 +598,7 @@ class LinearClient
           puts "Failed to create issue for batch item: #{key}"
         end
       end
+      puts "Continuing to next batch"
     end
   end
 
@@ -1485,6 +1520,11 @@ class MigrationManager
     migrate_epics
     fetch_linear_labels # refetch after migrating epics
     migrate_stories
+    save_mapping_to_file
+  end
+
+  def save_mapping_to_file
+    @linear_client.save_mapping_to_file
   end
 
   def assign
@@ -1629,7 +1669,10 @@ class MigrationManager
     # stories = stories.select { |story| [187478768, 188115984, 187772789].include?(story['id']) }
 
     # stories = stories.select { |story| story['id'] == 147268199 } # patric
-    # stories = stories.select { |story| story['id'] == 188559510 } # not imported accepted
+    # stories = stories.select { |story| story['id'] == 187166596 } # not imported accepted
+    # stories = stories.select { |story| story['id'] == 165064866 } # no body for some reason
+    # stories = stories.select { |story| story['id'] == 156666016 } # different comment text body
+    # stories = stories.select { |story| story['id'] == 188438229 } # new comment with new attachment that isn't in csv.
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
@@ -1759,6 +1802,8 @@ class MigrationManager
           next label['id']
         end.compact
 
+        description.gsub!(/!\[([^\]]+)\]/, '! [\1]')
+
         story_info = {
           title:,
           description:,
@@ -1768,6 +1813,7 @@ class MigrationManager
           requestedByToLinearUser:,
           state_id:
         }
+
         @linear_client.queue_issue_create( story_info)
       end
     end
@@ -1779,27 +1825,26 @@ class MigrationManager
 
   def queue_comments_for_story(story_id)
     if @pt_csv_reader.csv_given
-      # puts "Checking if story #{story_id} has attachments"
+      $logger.info "Checking if story #{story_id} has attachments"
       if @pt_csv_reader.is_story_with_attachments?(story_id.to_s)
-        # puts "Story #{story_id} has attachments"
+        $logger.info "Story #{story_id} has attachments"
+        $logger.info "Making a request to get comments from api for #{story_id}"
         comments = @pt_client.fetch_story_comments(story_id)
       else
-        # puts "Story #{story_id} does not have attachments"
+        $logger.info "Story #{story_id} does not have attachments"
         comments = @pt_csv_reader.find_by_pivotal_tracker_id(story_id)['comments']
       end
     else
       comments = @pt_client.fetch_story_comments(story_id)
     end
-    # $logger.info "Adding #{comments.size} comments to the description of the story #{story_id}"
-
-    # puts "Comments: #{comments.inspect}"
 
     if comments.empty?
       return
     end
 
-    comments.map do |comment|
-      full_body, subscriberIds = create_text_for_comment(comment)
+    $logger.info "Queueing comments for story #{story_id}"
+    comments.each_with_index.map do |comment, index|
+      full_body, subscriberIds = create_text_for_comment(index, comment)
       input = {
         story_id: story_id,
         comment: full_body,
@@ -1807,28 +1852,41 @@ class MigrationManager
       unless subscriberIds.nil?
         input["subscriber_ids"] = subscriberIds
       end
+      $logger.debug input.inspect
+
       @linear_client.queue_comment_create(input)
     end
   end
 
-  def create_text_for_comment(comment)
+  def create_text_for_comment(index, comment)
+    $logger.info "Create text for comment: #{comment['id']}"
     if @pt_csv_reader.csv_given && !@pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
-      # puts "Taking author,date from csv"
+      # If the CSV is given and the story does not have attachments, we can use the CSV data
       author_name = comment['author']
       date = comment['date']
       linearUser = find_matching_user(author_name)
     else
-      # puts "Taking author,date from api" 
+      # $logger.warn "Making a request to get author,date from api for #{comment['id']}"
       person_id = comment['person_id']
       person_info = @pt_team_members[person_id]
       unless person_info
+        # If the account is deleted, it won't show up in the team members list.
+        # We can try to find the comment from the csv.
         $logger.warn "Could not find person information for comment by person_id: #{person_id}"
-        return
+        $logger.debug "Comment: #{comment.inspect}"
+
+        story = @pt_csv_reader.find_by_pivotal_tracker_id(comment['story_id'])
+        if story
+            matchingCSVComment = story['comments'][index]
+            author_name = matchingCSVComment['author']
+            date = matchingCSVComment['date']
+        end
+      else
+        author_name = person_info['name']
+        created_at = comment['created_at']
+        date = Time.parse(created_at).strftime("%b %d, %Y")
+        linearUser = find_matching_user(author_name)
       end
-      author_name = person_info['name']
-      created_at = comment['created_at']
-      date = Time.parse(created_at).strftime("%b %d, %Y")
-      linearUser = find_matching_user(author_name)
     end
 
     displayName = "- @#{linearUser["displayName"]} - " if linearUser != nil
@@ -1837,10 +1895,10 @@ class MigrationManager
     # puts "Processing attachments"
     if @pt_csv_reader.csv_given
       if @pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
-        # puts "Story #{comment['story_id']} has attachments"
+        puts "Story #{comment['story_id']} has attachments"
         attachments = process_attachments(comment)
       else
-        # puts "Story #{comment['story_id']} does not have attachments"
+        puts "Story #{comment['story_id']} does not have attachments"
         attachments = []
       end
     else
@@ -1861,27 +1919,27 @@ class MigrationManager
       linearUser.nil? ? nil : linearUser["id"]
     ]
     for pt_user in @pt_team_members
-      puts "Checking for user: " + pt_user[1]["username"]
+      # puts "Checking for user: " + pt_user[1]["username"]
       pt_username = pt_user[1]["username"]
 
       linearUserComment = find_matching_user(pt_user[1]["name"])
       if linearUserComment.nil?
-        puts "no linear user found for " + pt_user[1]["name"]
+        $logger.debug "no linear user found for " + pt_user[1]["name"]
         next
       end
       linear_username = linearUserComment["displayName"]
 
-      puts body
+      # puts body
       if body.include?(pt_username)
-        puts "FOUND " + pt_username
-        puts "Replacing with " + linear_username
+        $logger.info "FOUND " + pt_username
+        $logger.info "Replacing with " + linear_username
         subscriber_ids.push(linearUserComment["id"])
         body = body.gsub("@" + pt_username, "@" + linear_username)
       end
     end
 
     full_body = "#{body}\n\n#{attachment_markdown}"
-    puts "Full body: #{full_body}"
+    # puts "Full body: #{full_body}"
 
     subscriber_ids = subscriber_ids.compact
     if subscriber_ids.empty?
@@ -1891,84 +1949,8 @@ class MigrationManager
     [full_body, subscriberIds]
   end
 
-  def migrate_story_comments_and_attachments(story_id, linear_issue_id)
-    if @pt_csv_reader.csv_given
-      # puts "Checking if story #{story_id} has attachments"
-      if @pt_csv_reader.is_story_with_attachments?(story_id.to_s)
-        # puts "Story #{story_id} has attachments"
-        comments = @pt_client.fetch_story_comments(story_id)
-      else
-        # puts "Story #{story_id} does not have attachments"
-        comments = @pt_csv_reader.find_by_pivotal_tracker_id(story_id)['comments']
-      end
-    else
-      comments = @pt_client.fetch_story_comments(story_id)
-    end
-    $logger.info "Migrating #{comments.size} comments for story #{story_id}"
-
-    comments.each do |comment|
-      process_story_comment(comment, linear_issue_id)
-    end
-  end
-
-  def process_story_comment(comment, linear_issue_id)
-    puts comment.inspect
-    if @pt_csv_reader.csv_given
-      puts "Taking author,date from csv"
-      author_name = comment['author']
-      date = comment['date']
-      puts "Author: #{author_name}, Date: #{date}"
-      puts "Comment: #{comment['text']}"
-    else
-      puts "Taking author,date from api" 
-      person_id = comment['person_id']
-      person_info = @pt_team_members[person_id]
-      unless person_info
-        $logger.warn "Could not find person information for comment by person_id: #{person_id}"
-        return
-      end
-      author_name = person_info['name']
-      created_at = comment['created_at']
-      date = Time.parse(created_at).strftime("%b %d, %Y")
-    end
-
-
-    body = "Comment by #{author_name} on #{date}:\n\n#{comment['text']}"
-
-    puts "Processing attachments"
-    if @pt_csv_reader.csv_given
-      if @pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
-        puts "Story #{comment['story_id']} has attachments"
-        attachments = process_attachments(comment)
-      else
-        puts "Story #{comment['story_id']} does not have attachments"
-        attachments = []
-      end
-    else
-      attachments = process_attachments(comment)
-    end
-
-    if @dry_run
-      $logger.info "[DRY RUN] Would create comment: '#{body[0..50]}...'"
-      if attachments.any?
-        $logger.info "[DRY RUN] Would create attachments: #{attachments.map { |a| a[:filename] }.join(', ')}"
-      end
-    else
-      linear_comment = @linear_client.create_comment_with_attachments(linear_issue_id, body, attachments)
-      if linear_comment
-        $logger.info "Created comment with #{attachments.size} attachments for issue #{linear_issue_id}"
-      else
-        $logger.error "Failed to create comment for issue #{linear_issue_id}"
-      end
-    end
-  rescue StandardError => e
-    $logger.error "Failed to process comment: #{e.message}"
-    $logger.debug "Comment structure: #{comment.inspect}"
-    $logger.debug e.backtrace.join("\n")
-  end
-
   def process_attachments(comment)
-    puts "*** COMMENT: #{comment.inspect}"
+    $logger.info "COMMENT: #{comment.inspect}"
     return [] unless comment['file_attachments']
 
     comment['file_attachments'].map do |attachment|
@@ -2062,6 +2044,13 @@ class MigrationManager
       file_path = ENV['PT_CSV_FILE']
       directory_path = File.dirname(file_path)
       temp_file_path = File.join(directory_path, story_id.to_s, attachment['filename'])
+      # Check if the file exists
+      if !File.exist?(temp_file_path)
+        # The file doesn't exist locally, download it.
+        $logger.info "The file #{temp_file_path} doesn't exist locally, downloading it."
+        temp_file_path = @pt_client.download_attachment(attachment['download_url'], attachment['filename'])
+      end
+
       puts "Story ID: #{story_id}"
       puts "Temp file path: #{temp_file_path}"
     end
