@@ -66,6 +66,7 @@ class PivotalCSVParser
   def parse_to_structure
       structured_data = {}
       @data.each_with_index do |row, i|
+          $logger.debug "Parsing row: #{i}"
           id = row[:id]
           structured_data[id] ||= {}
 
@@ -124,7 +125,7 @@ class PivotalCSVParser
 
               # Making labels similar to the API
               if @headers[j].to_s == "labels" && row[j] != nil
-                structured_data[id]['labels'] = row[j].split(',').map do |label|
+                structured_data[id]['labels'] = row[j].to_s.split(',').map do |label|
                 { 'name' => label.strip }
                 end
                 next
@@ -371,7 +372,7 @@ class LinearClient
     @already_migrated_epics = find_all_pt_epics_from_linear
 
     @issue_create_queue = []
-    @issue_create_batch = 40
+    @issue_create_batch = 20
 
     @comments_create_queue = []
     @comments_create_batch = 20
@@ -589,16 +590,17 @@ class LinearClient
           if match_data
             pt_id = match_data[1]
           else
-            puts "ENDED WITH ERROR"
-            puts "Failed to extract Pivotal Tracker ID from description"
+            $logger.error "Failed to extract Pivotal Tracker ID from description"
             exit(0)
           end 
           @pt_to_linear_mapping[pt_id] = linear_id
         else
-          puts "Failed to create issue for batch item: #{key}"
+          $logger.error "Failed to create issue for batch item: #{key}"
         end
       end
-      puts "Continuing to next batch"
+      puts "Continuing to next batch in 2 seconds"
+      # There is a different rate limit for creating issues
+      sleep(2)
     end
   end
 
@@ -1325,7 +1327,10 @@ class LinearClient
         return response
       elsif response.code == 429 || (response.code >= 400 && response.code < 500 && response.body.include?('RATELIMITED'))
         puts '[WARN] Rate limit exceeded. Waiting for reset.'
-        next
+      # rate limits are different when creating issues in batches
+      # elsif response.code == 200 && response.body.include?('RATELIMITED') && response.body.include?('ratelimit exceeded')
+      #   puts '[WARN] Rate limit exceeded. Waiting for reset.'
+      #   next
       else
         puts "[ERROR] API request failed: #{response.code}"
         puts "[ERROR] Response Body: #{response.body}"
@@ -1794,6 +1799,10 @@ class MigrationManager
         state_id = @linear_client.get_state_id(linear_state)
 
         label_ids = label_names.map do |name| 
+          if ["assignee", "cycle", "effort", "estimate", "hours", "priority", "project", "state", "status"].include?(name.downcase)
+            name = name + " label"
+            next
+          end
           if @linear_labels[name.downcase]
             next @linear_labels[name.downcase]
           end
@@ -1859,7 +1868,7 @@ class MigrationManager
   end
 
   def create_text_for_comment(index, comment)
-    $logger.info "Create text for comment: #{comment['id']}"
+    $logger.info "Create text for comment: #{comment.inspect}"
     if @pt_csv_reader.csv_given && !@pt_csv_reader.is_story_with_attachments?(comment['story_id'].to_s)
       # If the CSV is given and the story does not have attachments, we can use the CSV data
       author_name = comment['author']
@@ -1956,23 +1965,6 @@ class MigrationManager
     comment['file_attachments'].map do |attachment|
       process_attachment(attachment, comment['story_id'])
     end.compact
-  end
-
-  def assign_story_owner(linear_issue_id, pt_owner)
-    return if @dry_run
-    return unless pt_owner
-
-    user = find_matching_user("#{pt_owner['name']} <#{pt_owner['email']}>")
-    if user
-      result = @linear_client.assign_issue(linear_issue_id, user['id'])
-      if result
-        $logger.info "Assigned issue #{linear_issue_id} to #{user['name']}"
-      else
-        $logger.error "Failed to assign issue #{linear_issue_id} to #{user['name']}"
-      end
-    else
-      $logger.warn "Could not find matching user for #{pt_owner['name']} <#{pt_owner['email']}>"
-    end
   end
 
   def assign_unassigned_pt_stories
