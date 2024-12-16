@@ -23,7 +23,7 @@ class PivotalCSVParser
   attr_reader :structured_data
   attr_reader :csv_given
 
-  COMMENT_META_REGEX = /\s*\(([\w\s]+) - (\w{3} \d+, \d\d\d\d)\)$/
+  COMMENT_META_REGEX = /\s*\(([\w\s\.]+) - (\w{3} \d+, \d\d\d\d)\)$/
 
   def initialize(file_path)
       if file_path.nil? || file_path.empty?
@@ -86,6 +86,7 @@ class PivotalCSVParser
                   else
                       comments << { 'story_id' => id, 'text' => row[j], 'author' => nil, 'date' => nil }
                       $logger.error "Comment without author and date: #{row[j]}"
+
                   end
                   next
               end
@@ -126,6 +127,11 @@ class PivotalCSVParser
               # Making labels similar to the API
               if @headers[j].to_s == "labels" && row[j] != nil
                 structured_data[id]['labels'] = row[j].to_s.split(',').map do |label|
+                  if label.length > 75
+                    $logger.debug "Label too long: #{label}"
+                    label = label[0, 75]
+                  end
+                  $logger.debug "Cut Label: #{label.strip}"
                 { 'name' => label.strip }
                 end
                 next
@@ -542,7 +548,8 @@ class LinearClient
           title: story_info[:title],
           description: story_info[:description],
           teamId: @team_id,
-          stateId: story_info[:state_id]
+          stateId: story_info[:state_id],
+          projectId: story_info[:project_id]
         }
 
         subscriberIds = [
@@ -1303,6 +1310,8 @@ class LinearClient
       }
     }
 
+    $logger.debug "VARIABLES"
+    $logger.debug variables.inspect
     response = post(mutation, variables)
     log_response(response, 'Create Label')
 
@@ -1519,7 +1528,7 @@ class MigrationManager
 
   def migrate
     fetch_linear_labels
-    create_epic_mappings
+    create_epic_mappings # label to epic ID mapping
     set_team_settings
     load_team_members # adds all workspace users to the team
     migrate_epics
@@ -1564,6 +1573,10 @@ class MigrationManager
 
     epics.each do |epic|
       if epic['label'].is_a?(Hash) && epic['label']['name'] && epic['id']
+        if epic['label']['name'].length > 75
+          @label_to_epic_mapping[epic['label']['name'][0, 75]] = epic['id']
+          next
+        end
         @label_to_epic_mapping[epic['label']['name']] = epic['id']
       else
         $logger.warn "Unexpected epic structure: #{epic.inspect}"
@@ -1599,6 +1612,8 @@ class MigrationManager
     bar = ProgressBar.new(epics.size)
 
     epics.each do |epic|
+      epic['name'] = epic['name'][0, 75] if epic['name'].length > 75
+
       bar.increment!
 
       epic_id = epic['id']
@@ -1678,6 +1693,8 @@ class MigrationManager
     # stories = stories.select { |story| story['id'] == 165064866 } # no body for some reason
     # stories = stories.select { |story| story['id'] == 156666016 } # different comment text body
     # stories = stories.select { |story| story['id'] == 188438229 } # new comment with new attachment that isn't in csv.
+    # stories = stories.select { |story| story['id'] == 167634092} # author error
+    # stories = stories.select { |story| story['id'] == 154212377} # Long label/epic name
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
@@ -1688,6 +1705,18 @@ class MigrationManager
     previous_issue_id = nil # Track the last migrated issue
 
     sorted_stories.each do |story|
+      # Epics are already imported.
+      if story['type'] == 'epic'
+        next
+      end
+
+      # I have no words for this one. Took me a while to figure out what was going on.
+      if @pt_csv_reader.csv_given
+        title = story['title'] # Unlike the API, csv uses 'title' instead of 'name'
+      else
+        title = story['name']
+      end
+
       # puts "Story Details: #{story}"
       bar.increment!
       pt_link = "https://www.pivotaltracker.com/story/show/#{story['id']}"
@@ -1718,10 +1747,12 @@ class MigrationManager
 
       owners = story_details['owned_by'] ? story_details['owned_by'].map { |owner| owner }.join(', ') : 'Unassigned'
       description = "#{story_details['description']}\n\n---\nPivotal Story: #{pt_link}\n"
-      description += "Owner: #{owners}\nRequested by: #{requested_by}"
+      description += "Owner: #{owners}\nRequested by: #{requested_by}\n"
+      description += "Created at: #{story['created_at']}\n"
+      description += "Accepted at: #{story['accepted_at']}\n" if story['accepted_at']
 
       if @pt_csv_reader.csv_given
-        description += "\nPull Requests: " 
+        description += "Pull Requests: " 
         if story_details['pull_requests'].any?
           description += story_details['pull_requests'].map do |pr|
             pr_url = pr["url"]
@@ -1774,13 +1805,6 @@ class MigrationManager
         end
       end
 
-      # I have no words for this one. Took me a while to figure out what was going on.
-      if @pt_csv_reader.csv_given
-        title = story['title'] # Unlike the API, csv uses 'title' instead of 'name'
-      else
-        title = story['name']
-      end
-
       estimate = story['estimate'] ? story['estimate'].to_i : 'Unestimated'
 
       label_names = story_details['labels'].map { |label| label['name'] }
@@ -1798,6 +1822,7 @@ class MigrationManager
         linear_state = PT_TO_LINEAR_STATE[story['current_state']]
         state_id = @linear_client.get_state_id(linear_state)
 
+        $logger.debug "label_names: #{label_names}"
         label_ids = label_names.map do |name| 
           if ["assignee", "cycle", "effort", "estimate", "hours", "priority", "project", "state", "status"].include?(name.downcase)
             name = name + " label"
@@ -1813,6 +1838,13 @@ class MigrationManager
 
         description.gsub!(/!\[([^\]]+)\]/, '! [\1]')
 
+        for label in label_names do
+          epicID = @label_to_epic_mapping[label]
+          if epicID
+            project_id = @epic_mapping[epicID]
+          end
+        end
+
         story_info = {
           title:,
           description:,
@@ -1820,7 +1852,8 @@ class MigrationManager
           estimate:,
           ownerToLinearUser:,
           requestedByToLinearUser:,
-          state_id:
+          state_id:,
+          project_id:
         }
 
         @linear_client.queue_issue_create( story_info)
@@ -2085,7 +2118,7 @@ class MigrationManager
     tasks.each do |task|
       body = "Task: #{task['task']}\nStatus: #{task['complete'] ? 'completed' : 'not nompleted'}"
       if @dry_run
-        $logger.info "[DRY RUN] Would create task comment: '#{body[0..50]}...'"
+        $logger.info "[DRY RUN] Would create task comment: '#{body[0, 75]}...'"
       else
         @linear_client.create_comment(linear_id, body)
       end
