@@ -474,7 +474,8 @@ class LinearClient
         variables = batch.each_with_index.map do |comment_info, index|
           inputHash = {
             issueId: @pt_to_linear_mapping[comment_info[:story_id].to_s],
-            body: comment_info[:comment]
+            body: comment_info[:comment],
+            createdAt: comment_info[:createdAt] 
           }
 
           unless comment_info[:subscriberIds].nil?
@@ -495,6 +496,8 @@ class LinearClient
             puts "Failed to create comment for batch item: #{key}"
           end
         end
+        puts "Continuing to next batch of comments in 2 seconds"
+        sleep(4)
       end
     end
   end
@@ -549,7 +552,8 @@ class LinearClient
           description: story_info[:description],
           teamId: @team_id,
           stateId: story_info[:state_id],
-          projectId: story_info[:project_id]
+          projectId: story_info[:project_id],
+          createdAt: story_info[:created_at]
         }
 
         subscriberIds = [
@@ -607,7 +611,7 @@ class LinearClient
       end
       puts "Continuing to next batch in 2 seconds"
       # There is a different rate limit for creating issues
-      sleep(2)
+      sleep(4)
     end
   end
 
@@ -1694,7 +1698,8 @@ class MigrationManager
     # stories = stories.select { |story| story['id'] == 156666016 } # different comment text body
     # stories = stories.select { |story| story['id'] == 188438229 } # new comment with new attachment that isn't in csv.
     # stories = stories.select { |story| story['id'] == 167634092} # author error
-    # stories = stories.select { |story| story['id'] == 154212377} # Long label/epic name
+    # stories = stories.select { |story| story['id'] == 185814909 } # Long label/epic name
+    # stories = stories.select { |story| story['id'] == 185996423 } # Long label/epic name
 
     sorted_stories = stories.sort_by do |story|
       [STORY_STATE_ORDER[story['current_state']] || 6, story['created_at']]
@@ -1845,6 +1850,8 @@ class MigrationManager
           end
         end
 
+        created_at = story['created_at']
+
         story_info = {
           title:,
           description:,
@@ -1853,7 +1860,8 @@ class MigrationManager
           ownerToLinearUser:,
           requestedByToLinearUser:,
           state_id:,
-          project_id:
+          project_id:,
+          created_at:
         }
 
         @linear_client.queue_issue_create( story_info)
@@ -1886,10 +1894,11 @@ class MigrationManager
 
     $logger.info "Queueing comments for story #{story_id}"
     comments.each_with_index.map do |comment, index|
-      full_body, subscriberIds = create_text_for_comment(index, comment)
+      full_body, subscriberIds, date = create_text_for_comment(index, comment)
       input = {
         story_id: story_id,
         comment: full_body,
+        createdAt: date,
       }
       unless subscriberIds.nil?
         input["subscriber_ids"] = subscriberIds
@@ -1988,7 +1997,7 @@ class MigrationManager
       subscriberIds = nil
     end
 
-    [full_body, subscriberIds]
+    [full_body, subscriberIds, date]
   end
 
   def process_attachments(comment)
